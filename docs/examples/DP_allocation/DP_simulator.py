@@ -39,14 +39,16 @@ from desmod.queue import Queue
 from desmod.pool import Pool
 
 from desmod.simulation import simulate, simulate_factors
-ALLOCATION_SUCCESS="V"
-ALLOCATION_FAIL="F"
-ALLOCATION_REQUEST="allocation_request"
-NEW_TASK="new_task_created"
+
+ALLOCATION_SUCCESS = "V"
+ALLOCATION_FAIL = "F"
+ALLOCATION_REQUEST = "allocation_request"
+NEW_TASK = "new_task_created"
 # TASK_COMPLETION="task_completion"
-TASK_RESOURCE_RELEASE="resource_release"
-FCFS_POLICY="fcfs"
-RATE_LIMIT_POLICY="rate"
+TASK_RESOURCE_RELEASE = "resource_release"
+FCFS_POLICY = "fcfs"
+RATE_LIMIT_POLICY = "rate"
+
 
 class Top(Component):
     """The top-level component of the model."""
@@ -65,23 +67,29 @@ class Top(Component):
         # a meaningful manner. This must be done at pre-init time to allow
         # sim.gtkw.live to work.
         analog_kwargs = {
-            'datafmt': 'dec',
+            # 'datafmt': 'dec',
             'color': 'cycle',
             'extraflags': ['analog_step'],
         }
         with open(env.config['sim.gtkw.file'], 'w') as gtkw_file:
             gtkw = GTKWSave(gtkw_file)
             gtkw.dumpfile(env.config['sim.vcd.dump_file'], abspath=False)
-            gtkw.treeopen('grocery')
+            gtkw.treeopen('dp_sim')
             gtkw.signals_width(300)
-            gtkw.trace('customers.active', **analog_kwargs)
-            for i in range(env.config['grocery.num_lanes']):
-                with gtkw.group(f'Lane{i}'):
-                    scope = f'grocery.lane{i}'
-                    gtkw.trace(f'{scope}.customer_queue', **analog_kwargs)
-                    gtkw.trace(f'{scope}.feed_belt', **analog_kwargs)
-                    gtkw.trace(f'{scope}.bag_area', **analog_kwargs)
-                    gtkw.trace(f'{scope}.baggers', **analog_kwargs)
+            with gtkw.group(f'task'):
+                scope = 'tasks'
+                gtkw.trace(f'{scope}.active_count',datafmt='dec', **analog_kwargs)
+                gtkw.trace(f'{scope}.completion_count',datafmt='dec', **analog_kwargs)
+                gtkw.trace(f'{scope}.fail_count',datafmt='dec', **analog_kwargs)
+
+            # for i in range(env.config['grocery.num_lanes']):
+            with gtkw.group(f'resource'):
+                scope = 'resource_master'
+                gtkw.trace(f'{scope}.cpu_pool', datafmt='dec',**analog_kwargs)
+                gtkw.trace(f'{scope}.gpu_pool',datafmt='dec', **analog_kwargs)
+                gtkw.trace(f'{scope}.memory_pool',datafmt='dec', **analog_kwargs)
+                gtkw.trace(f'{scope}.unused_dp',datafmt='real', **analog_kwargs)
+                gtkw.trace(f'{scope}.committed_dp',datafmt='real', **analog_kwargs)
 
     def elab_hook(self):
         # We generate DOT representations of the component hierarchy. It is
@@ -89,11 +97,14 @@ class Top(Component):
         # connected, thus generate_dot() is called here in elab_hook().
         generate_dot(self)
 
+
 class InsufficientDpException(Exception):
     pass
 
+
 class RejectAllocException(Exception):
     pass
+
 
 class ResourceMaster(Component):
     """Model a grocery store with checkout lanes, cashiers, and baggers."""
@@ -102,17 +113,30 @@ class ResourceMaster(Component):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.unused_dp = Pool(self.env)
+        self.auto_probe('unused_dp',vcd={'var_type': 'real'})
+
+        self.committed_dp = Pool(self.env)
+
+        self.auto_probe('committed_dp', vcd={'var_type': 'real'})
+
         self.block_dp_storage = Queue(self.env, capacity=float("inf"))
         # self.block_waiting_containers = [] # [[],[],...,[] ], put each task's waiting DP container in sublist
         self.is_cpu_limited_only = self.env.config['resource_master.is_cpu_limited_only']
-        self.cpu_pool = Pool(self.env, capacity=self.env.config["resource_master.cpu_capacity"],  init=self.env.config["resource_master.cpu_capacity"], hard_cap=True)
+        self.cpu_pool = Pool(self.env, capacity=self.env.config["resource_master.cpu_capacity"],
+                             init=self.env.config["resource_master.cpu_capacity"], hard_cap=True)
+        self.auto_probe('cpu_pool', vcd={})
 
-        if not self.is_cpu_limited_only:
-            self.memory_pool = Pool(self.env, capacity=self.env.config["resource_master.memory_capacity"], init=self.env.config["resource_master.memory_capacity"],hard_cap=True)
-            self.gpu_pool = Pool(self.env, capacity=self.env.config["resource_master.gpu_capacity"], init=self.env.config["resource_master.gpu_capacity"], hard_cap=True)
+        self.memory_pool = Pool(self.env, capacity=self.env.config["resource_master.memory_capacity"],
+                                init=self.env.config["resource_master.memory_capacity"], hard_cap=True)
+        self.auto_probe('memory_pool', vcd={})
+
+        self.gpu_pool = Pool(self.env, capacity=self.env.config["resource_master.gpu_capacity"],
+                             init=self.env.config["resource_master.gpu_capacity"], hard_cap=True)
+        self.auto_probe('gpu_pool', vcd={})
 
         self.mail_box = Queue(self.env)
-        self.task_state = dict() # {task_id:{...},...,}
+        self.task_state = dict()  # {task_id:{...},...,}
         self.add_processes(self.generate_datablocks)
         self.add_processes(self.allocator_loop)
         self.period = 1
@@ -132,6 +156,8 @@ class ResourceMaster(Component):
             elif msg["message_type"] == ALLOCATION_REQUEST:
                 assert msg["task_id"] in self.task_state
                 self.task_state[msg["task_id"]]["resource_request"] = msg
+                self.task_state[msg["task_id"]]["dp_commit_time"] = None
+
                 self.task_state[msg["task_id"]]["allocation_done_event"] = msg.pop("allocation_done_event")
                 self.task_state[msg["task_id"]]["task_completion_event"] = self.env.event()
                 # self.task_state[msg["task_id"]]["finished"] = False
@@ -139,7 +165,7 @@ class ResourceMaster(Component):
                 ## trigger allocation
                 handler_proc = self.env.process(task_handler_gen)
                 self.task_state[msg["task_id"]]["handler_proc"] = handler_proc
-                self.task_state[msg["task_id"]]["accum_containers"] = dict() # blk_idx: container
+                self.task_state[msg["task_id"]]["accum_containers"] = dict()  # blk_idx: container
                 for i in msg["block_idx"]:
                     cn = Pool(self.env, capacity=float('inf'), init=0.0)
                     self.task_state[msg["task_id"]]["accum_containers"][i] = cn
@@ -149,8 +175,7 @@ class ResourceMaster(Component):
                 assert msg["task_id"] in self.task_state
                 # self.task_state[msg["task_id"]]["finished"] = True
 
-
-    def task_handler(self,task_id):
+    def task_handler(self, task_id):
         self.debug(task_id, "Task handler created")
         this_task = self.task_state[task_id]
         allocation_done_event = this_task["allocation_done_event"]
@@ -179,7 +204,7 @@ class ResourceMaster(Component):
                 self.debug(task_id, "request DP interrupted")
                 allocation_done_event.fail(RejectAllocException("request DP interrupted"))
                 # return DP to block
-                for get_event,blk_idx in get_dp_events.items():
+                for get_event, blk_idx in get_dp_events.items():
                     # level reduced
                     if get_event.triggered:
                         self.block_dp_storage.items[blk_idx]["dp_container"].put(get_event.amount)
@@ -192,7 +217,7 @@ class ResourceMaster(Component):
             try:
                 unget_blk_ids = set(get_dp_events.values())
                 while (len(unget_blk_ids) != 0):
-                    listened_gets = (get for get,blk in get_dp_events.items() if blk in unget_blk_ids)
+                    listened_gets = (get for get, blk in get_dp_events.items() if blk in unget_blk_ids)
                     succeed_gets = yield self.env.any_of(listened_gets)
                     for g in succeed_gets:
                         blk_idx = get_dp_events[g]
@@ -230,7 +255,9 @@ class ResourceMaster(Component):
                 self.debug(task_id, e)
                 return
 
-        self._commit_dp_allocation(resource_demand["block_idx"], epsilon=resource_demand["epsilon"])
+        yield from self._commit_dp_allocation(resource_demand["block_idx"], epsilon=resource_demand["epsilon"])
+
+        self.task_state[task_id]["dp_commit_time"] = self.env.now
 
         get_cpu_event = self.cpu_pool.get(resource_demand["cpu"])
         if not self.is_cpu_limited_only:
@@ -256,10 +283,10 @@ class ResourceMaster(Component):
         self.debug(task_id, "Resource released")
         resource_release_msg = {
             "message_type": TASK_RESOURCE_RELEASE,
-            "task_id": task_id }
+            "task_id": task_id}
         yield self.mail_box.put(resource_release_msg)
 
-## for rate limit policy
+    ## for rate limit policy
     def rate_release_dp(self, block_id):
         is_active = False
         rate = 0
@@ -285,7 +312,8 @@ class ResourceMaster(Component):
                 # todo or > capacity or level??
                 if this_task["resource_request"]["epsilon"] > this_block["dp_container"].capacity:
                     this_block["accum_containers"].pop(task_id)
-                    this_task["handler_proc"].interrupt("block %d, Insufficient DP left for task %d" % (block_id,task_id))
+                    this_task["handler_proc"].interrupt(
+                        "block %d, Insufficient DP left for task %d" % (block_id, task_id))
 
             waiting_task_nr = len(this_block["accum_containers"])
             if waiting_task_nr != 0:
@@ -297,12 +325,11 @@ class ResourceMaster(Component):
                 try:
                     yield this_block["dp_container"].get(rate)
                 except Exception as e:
-                    self.debug(block_id, "rate %d waiter_nr %d" % (rate, waiting_task_nr) )
+                    self.debug(block_id, "rate %d waiter_nr %d" % (rate, waiting_task_nr))
                 for task_id, cn in this_block["accum_containers"].items():
-                    cn.put(rate/waiting_task_nr)
+                    cn.put(rate / waiting_task_nr)
             else:
                 is_active = False
-
 
     def generate_datablocks(self):
         init_block_nr = 0
@@ -316,14 +343,15 @@ class ResourceMaster(Component):
             # yield block_id
             cur_block_id = next(block_id)
             total_dp = self.env.config['resource_master.block.init_epsilon']
-            new_block = Pool(self.env, capacity=total_dp,init=total_dp, name=cur_block_id)
+            new_block = Pool(self.env, capacity=total_dp, init=total_dp, name=cur_block_id)
             block_item = {
                 "dp_container": new_block,
                 # lifetime :=  # of periods from born to end
                 "end_of_life": self.env.now + self.env.config['resource_master.block.lifetime'] - 1,
-                "accum_containers": dict(), # task_id: container
+                "accum_containers": dict(),  # task_id: container
             }
             yield self.block_dp_storage.put(block_item)
+            self.unused_dp.put(total_dp)
             # self.debug(block_id, "new data block created")
             # self.block_waiting_containers.append([])
             if self.policy == RATE_LIMIT_POLICY:
@@ -343,11 +371,14 @@ class ResourceMaster(Component):
             try:
                 assert self.block_dp_storage.items[i]["dp_container"].capacity >= epsilon
             except:
-                raise Exception("Verification failed, insufficient epsilon to commit: data block idx %d, DP demand %.3f, uncommitted DP %.3f" % (i , epsilon, self.block_dp_storage.items[i].capacity))
+                raise Exception(
+                    "Verification failed, insufficient epsilon to commit: data block idx %d, DP demand %.3f, uncommitted DP %.3f" % (
+                        i, epsilon, self.block_dp_storage.items[i].capacity))
 
         for i in block_idx:
-
             self.block_dp_storage.items[i]["dp_container"].capacity -= epsilon
+        yield self.unused_dp.get( epsilon * len(block_idx))
+        self.committed_dp.put( epsilon * len(block_idx))
 
 
 
@@ -374,19 +405,34 @@ class Tasks(Component):
         self.add_process(self.generate_tasks)
         self.active_count = Container(self.env)
         self.auto_probe('active_count', vcd={})
-        self.db = None
-        # if self.env.tracemgr.sqlite_tracer.enabled:
-        #     self.db = self.env.tracemgr.sqlite_tracer.db
-        #     self.db.execute(
-        #         'CREATE TABLE customers '
-        #         '(cust_id INTEGER PRIMARY KEY,'
-        #         ' num_items INTEGER,'
-        #         ' shop_time REAL,'
-        #         ' checkout_time REAL)'
-        #     )
-        # else:
-        #     self.db = None
 
+        self.completion_count = Container(self.env)
+        self.auto_probe('completion_count', vcd={})
+
+        self.fail_count = Container(self.env)
+        self.auto_probe('fail_count', vcd={})
+
+        # self.db = None
+        if self.env.tracemgr.sqlite_tracer.enabled:
+            self.db = self.env.tracemgr.sqlite_tracer.db
+            self.db.execute(
+                'CREATE TABLE tasks '
+                '(task_id INTEGER PRIMARY KEY,'
+                ' start_block_id INTEGER,'
+                ' num_blocks INTEGER,'
+                ' epsilon REAL,'
+                ' cpu INTEGER,'
+                ' gpu INTEGER,'
+                ' memory INTEGER,'
+                ' start_time REAL,'
+                ' dp_allocation_time REAL,'
+                ' dp_allocation_duration REAL,'
+                ' other_allocation_time REAL,'
+                ' completion_time REAL'
+                ')'
+            )
+        else:
+            self.db = None
 
         self.cpu_dist = partial(self.env.rand.randint, 1, self.env.config['task.demand.num_cpu.max'])
         self.memory_dist = partial(self.env.rand.randint, 1, self.env.config['task.demand.size_memory.max'])
@@ -394,7 +440,8 @@ class Tasks(Component):
         self.completion_time_dist = partial(self.env.rand.randint, 1, self.env.config['task.completion_time.max'])
 
         self.epsilon_dist = partial(
-            self.env.rand.uniform,0,self.env.config['resource_master.block.init_epsilon'] / self.env.config['task.demand.epsilon.mean_tasks_per_block'] * 2
+            self.env.rand.uniform, 0, self.env.config['resource_master.block.init_epsilon'] / self.env.config[
+                'task.demand.epsilon.mean_tasks_per_block'] * 2
         )
 
         num_blocks_mu = self.env.config['task.demand.num_blocks.mu']
@@ -402,7 +449,6 @@ class Tasks(Component):
         self.num_blocks_dist = partial(
             self.env.rand.normalvariate, num_blocks_mu, num_blocks_sigma
         )
-
 
     def generate_tasks(self):
         """Generate grocery store customers.
@@ -424,7 +470,7 @@ class Tasks(Component):
 
             task_process = self.env.process(self.task(t_id))
             new_task_msg = {"message_type": NEW_TASK,
-                           "task_id": t_id,
+                            "task_id": t_id,
                             "task_process": task_process,
                             }
 
@@ -440,22 +486,22 @@ class Tasks(Component):
         t0 = self.env.now
         # query existing data blocks
         num_stored_blocks = len(self.resource_master.block_dp_storage.items)
-        num_blocks_demand = min(max(1, round(self.num_blocks_dist())),  num_stored_blocks)
+        num_blocks_demand = min(max(1, round(self.num_blocks_dist())), num_stored_blocks)
 
         self.debug(task_id, 'DP demand epsilon=%.3f for %d blocks' % (epsilon, num_blocks_demand))
         allocation_done_event = self.env.event()
         resource_request_msg = {
-                        "message_type": ALLOCATION_REQUEST,
-                        "task_id": task_id,
-                        "cpu": self.cpu_dist(),
-                       "memory": self.memory_dist(),
-                       "gpu": self.gpu_dist(),
-                       "epsilon" : epsilon,
-                       "block_idx": list(range(num_stored_blocks))[-num_blocks_demand:], # choose latest num_blocks_demand
-                       "completion_time":self.completion_time_dist(),
-                        "allocation_done_event": allocation_done_event,
-                       "user_id": None,
-                       "model_id": None}
+            "message_type": ALLOCATION_REQUEST,
+            "task_id": task_id,
+            "cpu": self.cpu_dist(),
+            "memory": self.memory_dist(),
+            "gpu": self.gpu_dist(),
+            "epsilon": epsilon,
+            "block_idx": list(range(num_stored_blocks))[-num_blocks_demand:],  # choose latest num_blocks_demand
+            "completion_time": self.completion_time_dist(),
+            "allocation_done_event": allocation_done_event,
+            "user_id": None,
+            "model_id": None}
 
         yield self.resource_master.mail_box.put(resource_request_msg)
 
@@ -465,26 +511,41 @@ class Tasks(Component):
             # allocation_done_event = self.resource_master.task_state[task_id]["allocation_done_event"]
 
             yield allocation_done_event
-            allocation_done_time = self.env.now - t0
+            dp_allocation_time = self.resource_master.task_state[task_id]["dp_commit_time"]
 
-            
-            self.debug(task_id, 'Allocation succeeded after', timedelta(seconds=allocation_done_time))
+            alloc_done_time = self.env.now
+            allocation_wait_duration = alloc_done_time - t0
+            self.debug(task_id, 'Allocation succeeded after', timedelta(seconds=allocation_wait_duration))
             # running task
             yield self.env.timeout(resource_request_msg["completion_time"])
             completion_event = self.resource_master.task_state[task_id]["task_completion_event"]
             completion_event.succeed()
 
             # yield self.resource_master.mail_box.put(task_completion_msg)
-
-            jct = self.env.now - t0
-            self.debug(task_id, 'Task completed after', timedelta(seconds=jct))
+            task_completion_time = self.env.now
+            task_completion_duration = task_completion_time - t0
+            self.debug(task_id, 'Task completed after', timedelta(seconds=task_completion_duration))
 
         except (InsufficientDpException, RejectAllocException) as e:
-            allocation_done_time = self.env.now - t0
+            alloc_done_time = None
+            task_completion_time = None
+            allocation_rej_time = dp_allocation_time = self.env.now
+            allocation_rej_duration = allocation_rej_time - t0
+            self.fail_count.put(1)
             self.debug(task_id, e)
-            self.debug(task_id, 'Allocation failed after', timedelta(seconds=allocation_done_time))
+            self.debug(task_id, 'Allocation failed after', timedelta(seconds=allocation_rej_duration))
 
         yield self.active_count.get(1)
+        self.completion_count.put(1)
+        if self.db:
+            self.db.execute(
+                'INSERT INTO tasks '
+                '(task_id, start_block_id, num_blocks, epsilon, cpu, gpu, memory, start_time, dp_allocation_time, dp_allocation_duration, other_allocation_time, completion_time ) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                (task_id, resource_request_msg["block_idx"][0], num_blocks_demand, resource_request_msg["epsilon"],
+                 resource_request_msg["cpu"], resource_request_msg["gpu"], resource_request_msg["memory"], t0,
+                 dp_allocation_time, dp_allocation_time-t0, alloc_done_time, task_completion_time),
+            )
 
         return
 
@@ -492,27 +553,63 @@ class Tasks(Component):
         # yield self.env.all_of([self.env.timeout(self.env.config['task.completion_time.max']), allocation_done_event])
 
 
-
-
     def get_result_hook(self, result):
         if not self.db:
             return
-        result['checkout_time_avg'] = self.db.execute(
-            'SELECT AVG(checkout_time) FROM customers'
-        ).fetchone()[0]
-        result['checkout_time_min'] = self.db.execute(
-            'SELECT MIN(checkout_time) FROM customers'
-        ).fetchone()[0]
-        result['checkout_time_max'] = self.db.execute(
-            'SELECT MAX(checkout_time) FROM customers'
-        ).fetchone()[0]
-        result['customers_total'] = self.db.execute(
-            'SELECT COUNT() FROM customers'
-        ).fetchone()[0]
-        result['customers_per_hour'] = result['customers_total'] / (
-            self.env.time() / 3600
-        )
+        sql_percentile = """
+        with nt_table as
+         (
+             select dp_allocation_duration, ntile(%d) over (order by dp_allocation_duration desc) ntile
+             from tasks
+             where completion_time is not null
+         )
 
+select avg(a)
+from (
+         select min(dp_allocation_duration) a
+         from nt_table
+         where ntile = 1
+
+         union
+         select max(dp_allocation_duration) a
+         from nt_table
+         where ntile = 2
+     )"""
+        result['dp_allocation_duration_avg'] = self.db.execute(
+            'SELECT AVG(dp_allocation_duration) FROM tasks WHERE completion_time IS NOT NULL '
+        ).fetchone()[0]
+
+        result['dp_allocation_duration_min'] = self.db.execute(
+            'SELECT MIN(dp_allocation_duration) FROM tasks WHERE completion_time IS NOT NULL'
+        ).fetchone()[0]
+
+        result['dp_allocation_duration_max'] = self.db.execute(
+            'SELECT MAX(dp_allocation_duration) FROM tasks WHERE completion_time IS NOT NULL'
+        ).fetchone()[0]
+
+        result['dp_allocation_duration_P99'] = self.db.execute(
+            sql_percentile % 2
+        ).fetchone()[0]
+
+        result['dp_allocation_duration_P99'] = self.db.execute(
+            sql_percentile % 100
+        ).fetchone()[0]
+
+        result['dp_allocation_duration_P999'] = self.db.execute(
+            sql_percentile % 1000
+        ).fetchone()[0]
+
+        result['dp_allocation_duration_P9999'] = self.db.execute(
+            sql_percentile % 10000
+        ).fetchone()[0]
+
+        result['succeed_tasks_total'] = self.db.execute(
+            'SELECT COUNT() FROM tasks  WHERE completion_time IS NOT NULL'
+        ).fetchone()[0]
+
+        result['succeed_tasks_per_hour'] = result['succeed_tasks_total'] / (
+                self.env.time() / 3600
+        )
 
 if __name__ == '__main__':
     config = {
@@ -522,7 +619,7 @@ if __name__ == '__main__':
         'cashier.scan_time': 2.0,
         'checkout.bag_area_capacity': 15,
         'checkout.feed_capacity': 20,
-        
+
         'task.arrival_interval': 20,
         'task.demand.num_blocks.mu': 6,
         'task.demand.num_blocks.sigma': 5,
@@ -544,19 +641,19 @@ if __name__ == '__main__':
         # https://cloud.google.com/compute/docs/gpus
         # V100 VM instance
         'resource_master.is_cpu_limited_only': True,
-        'resource_master.cpu_capacity': 96, # number of cores
-        'resource_master.memory_capacity': 624, # in GB, assume granularity is 1GB
+        'resource_master.cpu_capacity': 96,  # number of cores
+        'resource_master.memory_capacity': 624,  # in GB, assume granularity is 1GB
         'resource_master.gpu_capacity': 8,  # in cards
 
         'grocery.num_baggers': 1,
         'grocery.num_lanes': 2,
         'sim.db.enable': True,
-        'sim.db.persist': False,
+        'sim.db.persist': True,
         'sim.dot.colorscheme': 'blues5',
         'sim.dot.enable': True,
         'sim.duration': '100000 s',
         'sim.gtkw.file': 'sim.gtkw',
-        'sim.gtkw.live': False,
+        'sim.gtkw.live': True,
         'sim.log.enable': True,
         "sim.log.level": "DEBUG",
         'sim.progress.enable': False,
