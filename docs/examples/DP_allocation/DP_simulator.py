@@ -14,7 +14,7 @@ customer profiles.
 from argparse import ArgumentParser
 from datetime import timedelta
 from functools import partial
-from itertools import count
+from itertools import count, tee
 import simpy
 from simpy import Container, Resource, Store, Event
 from simpy.events import PENDING
@@ -31,6 +31,7 @@ from typing import (
 )
 from simpy.core import BoundClass, Environment
 import random
+from pyDigitalWaveTools.vcd.parser import VcdParser
 
 from desmod.component import Component
 from desmod.config import apply_user_overrides, parse_user_factors
@@ -78,18 +79,18 @@ class Top(Component):
             gtkw.signals_width(300)
             with gtkw.group(f'task'):
                 scope = 'tasks'
-                gtkw.trace(f'{scope}.active_count',datafmt='dec', **analog_kwargs)
-                gtkw.trace(f'{scope}.completion_count',datafmt='dec', **analog_kwargs)
-                gtkw.trace(f'{scope}.fail_count',datafmt='dec', **analog_kwargs)
+                gtkw.trace(f'{scope}.active_count', datafmt='dec', **analog_kwargs)
+                gtkw.trace(f'{scope}.completion_count', datafmt='dec', **analog_kwargs)
+                gtkw.trace(f'{scope}.fail_count', datafmt='dec', **analog_kwargs)
 
             # for i in range(env.config['grocery.num_lanes']):
             with gtkw.group(f'resource'):
                 scope = 'resource_master'
-                gtkw.trace(f'{scope}.cpu_pool', datafmt='dec',**analog_kwargs)
-                gtkw.trace(f'{scope}.gpu_pool',datafmt='dec', **analog_kwargs)
-                gtkw.trace(f'{scope}.memory_pool',datafmt='dec', **analog_kwargs)
-                gtkw.trace(f'{scope}.unused_dp',datafmt='real', **analog_kwargs)
-                gtkw.trace(f'{scope}.committed_dp',datafmt='real', **analog_kwargs)
+                gtkw.trace(f'{scope}.cpu_pool', datafmt='dec', **analog_kwargs)
+                gtkw.trace(f'{scope}.gpu_pool', datafmt='dec', **analog_kwargs)
+                gtkw.trace(f'{scope}.memory_pool', datafmt='dec', **analog_kwargs)
+                gtkw.trace(f'{scope}.unused_dp', datafmt='real', **analog_kwargs)
+                gtkw.trace(f'{scope}.committed_dp', datafmt='real', **analog_kwargs)
 
     def elab_hook(self):
         # We generate DOT representations of the component hierarchy. It is
@@ -114,7 +115,7 @@ class ResourceMaster(Component):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.unused_dp = Pool(self.env)
-        self.auto_probe('unused_dp',vcd={'var_type': 'real'})
+        self.auto_probe('unused_dp', vcd={'var_type': 'real'})
 
         self.committed_dp = Pool(self.env)
 
@@ -377,10 +378,29 @@ class ResourceMaster(Component):
 
         for i in block_idx:
             self.block_dp_storage.items[i]["dp_container"].capacity -= epsilon
-        yield self.unused_dp.get( epsilon * len(block_idx))
-        self.committed_dp.put( epsilon * len(block_idx))
+        yield self.unused_dp.get(epsilon * len(block_idx))
+        self.committed_dp.put(epsilon * len(block_idx))
 
+    def get_result_hook(self, result):
+        if self.env.tracemgr.vcd_tracer.enabled:
+            cpu_capacity = self.env.config['resource_master.cpu_capacity']
+            with open(self.env.config["sim.vcd.dump_file"]) as vcd_file:
+                from functools import reduce
+                vcd = VcdParser()
+                vcd.parse(vcd_file)
+                root_data = vcd.scope.toJson()
+                assert root_data['children'][0]['children'][2]['name'] == "cpu_pool"
+                # at least 10 sample
+                assert len(root_data['children'][0]['children'][2]['data']) > 10
+                idle_cpu_record = map(lambda t: (t[0], eval('0' + t[1])),
+                                      root_data['children'][0]['children'][2]['data'])
+                t1, t2 = tee(idle_cpu_record)
+                next(t2)
+                cpu_util_time = map(lambda t: (cpu_capacity - t[0][1]) * (t[1][0] - t[0][0]), zip(t1, t2))
 
+            # cal over start and end
+            result['CPU_utilization%'] = 100 * sum(cpu_util_time) / root_data['children'][0]['children'][2]['data'][-1][
+                0]
 
 
 class Tasks(Component):
@@ -544,7 +564,7 @@ class Tasks(Component):
                 'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
                 (task_id, resource_request_msg["block_idx"][0], num_blocks_demand, resource_request_msg["epsilon"],
                  resource_request_msg["cpu"], resource_request_msg["gpu"], resource_request_msg["memory"], t0,
-                 dp_allocation_time, dp_allocation_time-t0, alloc_done_time, task_completion_time),
+                 dp_allocation_time, dp_allocation_time - t0, alloc_done_time, task_completion_time),
             )
 
         return
@@ -552,10 +572,10 @@ class Tasks(Component):
         # todo, async compute while wait for DP allocation??
         # yield self.env.all_of([self.env.timeout(self.env.config['task.completion_time.max']), allocation_done_event])
 
-
     def get_result_hook(self, result):
         if not self.db:
             return
+        # WARN not exact cal for median
         sql_percentile = """
         with nt_table as
          (
@@ -611,6 +631,7 @@ from (
                 self.env.time() / 3600
         )
 
+
 if __name__ == '__main__':
     config = {
         'bagger.bag_time': 1.5,
@@ -656,13 +677,13 @@ if __name__ == '__main__':
         'sim.gtkw.live': True,
         'sim.log.enable': True,
         "sim.log.level": "DEBUG",
-        'sim.progress.enable': False,
+        'sim.progress.enable': True,
         'sim.result.file': 'result.json',
         'sim.seed': 1234,
         'sim.timescale': 's',
-        'sim.vcd.dump_file': 'sim.vcd',
+        'sim.vcd.dump_file': 'sim_dp.vcd',
         'sim.vcd.enable': True,
-        'sim.vcd.persist': False,
+        'sim.vcd.persist': True,
         'sim.workspace': 'workspace',
     }
 
