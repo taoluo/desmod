@@ -39,16 +39,17 @@ from desmod.dot import generate_dot
 from desmod.queue import Queue
 from desmod.pool import Pool
 
-from desmod.simulation import simulate, simulate_factors
+from desmod.simulation import simulate, simulate_factors, simulate_many
 
 ALLOCATION_SUCCESS = "V"
 ALLOCATION_FAIL = "F"
 ALLOCATION_REQUEST = "allocation_request"
 NEW_TASK = "new_task_created"
 # TASK_COMPLETION="task_completion"
-TASK_RESOURCE_RELEASE = "resource_release"
-FCFS_POLICY = "fcfs"
-RATE_LIMIT_POLICY = "rate"
+TASK_RESOURCE_RELEASED = "resource_release"
+
+POLICY_FCFS = "fcfs"
+POLICY_RATE_LIMIT = "rate"
 
 
 class Top(Component):
@@ -116,7 +117,7 @@ class ResourceMaster(Component):
         super().__init__(*args, **kwargs)
         self.unused_dp = Pool(self.env)
         self.auto_probe('unused_dp', vcd={'var_type': 'real'})
-
+        self.init_block_ready = self.env.event()
         self.committed_dp = Pool(self.env)
 
         self.auto_probe('committed_dp', vcd={'var_type': 'real'})
@@ -170,9 +171,9 @@ class ResourceMaster(Component):
                 for i in msg["block_idx"]:
                     cn = Pool(self.env, capacity=float('inf'), init=0.0)
                     self.task_state[msg["task_id"]]["accum_containers"][i] = cn
-                self.block_dp_storage.items[i]["accum_containers"][msg['task_id']] = cn
+                    self.block_dp_storage.items[i]["accum_containers"][msg['task_id']] = cn
 
-            elif msg["message_type"] == TASK_RESOURCE_RELEASE:
+            elif msg["message_type"] == TASK_RESOURCE_RELEASED:
                 assert msg["task_id"] in self.task_state
                 # self.task_state[msg["task_id"]]["finished"] = True
 
@@ -193,12 +194,12 @@ class ResourceMaster(Component):
         # getevent: blk_idx
         get_dp_events = dict()
         for i in resource_demand["block_idx"]:
-            if self.policy == FCFS_POLICY:
+            if self.policy == POLICY_FCFS:
                 get_dp_events[self.block_dp_storage.items[i]["dp_container"].get(resource_demand["epsilon"])] = i
-            elif self.policy == RATE_LIMIT_POLICY:
+            elif self.policy == POLICY_RATE_LIMIT:
                 get_dp_events[this_task['accum_containers'][i].get(resource_demand["epsilon"])] = i
 
-        if self.policy == FCFS_POLICY:
+        if self.policy == POLICY_FCFS:
             try:
                 yield self.env.all_of(get_dp_events)
             except simpy.Interrupt as e:
@@ -214,7 +215,7 @@ class ResourceMaster(Component):
                 self.debug(task_id, e)
                 return
 
-        elif self.policy == RATE_LIMIT_POLICY:
+        elif self.policy == POLICY_RATE_LIMIT:
             try:
                 unget_blk_ids = set(get_dp_events.values())
                 while (len(unget_blk_ids) != 0):
@@ -236,7 +237,7 @@ class ResourceMaster(Component):
 
                 for blk_idx in resource_demand["block_idx"]:
                     # pop, stop task's all waiting container
-                    if task_id in self.block_dp_storage.items[blk_idx]:
+                    if task_id in self.block_dp_storage.items[blk_idx]["accum_containers"]:
                         self.block_dp_storage.items[blk_idx]["accum_containers"].pop(task_id)
 
                 for blk_idx, get_event in zip(resource_demand["block_idx"], get_dp_events):
@@ -247,8 +248,10 @@ class ResourceMaster(Component):
                     left_accum = accum_container.level
                     if left_accum:
                         yield accum_container.get(left_accum)
+                        # if not self.block_dp_storage.items[blk_idx]["is_dead"]:
                         self.block_dp_storage.items[blk_idx]["dp_container"].put(left_accum)
                     if get_event.triggered:
+                        # if not self.block_dp_storage.items[blk_idx]["is_dead"]:
                         self.block_dp_storage.items[blk_idx]["dp_container"].put(get_event.amount)
                     else:
                         get_event.cancel()
@@ -283,7 +286,7 @@ class ResourceMaster(Component):
             yield put_cpu_event
         self.debug(task_id, "Resource released")
         resource_release_msg = {
-            "message_type": TASK_RESOURCE_RELEASE,
+            "message_type": TASK_RESOURCE_RELEASED,
             "task_id": task_id}
         yield self.mail_box.put(resource_release_msg)
 
@@ -295,15 +298,15 @@ class ResourceMaster(Component):
         while True:
             yield self.clock_tick()
             # self.debug(block_id,"clock tick")
-            rest_of_life = this_block["end_of_life"] - self.env.now
-            if rest_of_life < 0:
+            rest_of_life = this_block["end_of_life"] - self.env.now + 1
+            if rest_of_life <= 0:
                 if waiting_task_nr != 0:
                     self.debug(block_id, "end of life, with %d waiting tasks' demand" % waiting_task_nr)
                     for task_id in this_block["accum_containers"]:
                         this_task = self.task_state[task_id]
                         if this_task["handler_proc"]._value is PENDING:
                             this_task["handler_proc"].interrupt("block %d reaches end of life" % block_id)
-
+                this_block["is_dead"] = True
                 return
 
             # copy, to avoid iterate over a changing dictionary
@@ -317,7 +320,7 @@ class ResourceMaster(Component):
                         "block %d, Insufficient DP left for task %d" % (block_id, task_id))
 
             waiting_task_nr = len(this_block["accum_containers"])
-            if waiting_task_nr != 0:
+            if waiting_task_nr > 0:
                 # activate block
                 if not is_active:
                     # some dp may left due to task's return operation
@@ -333,14 +336,21 @@ class ResourceMaster(Component):
                 is_active = False
 
     def generate_datablocks(self):
-        init_block_nr = 0
+        cur_block_nr = 0 # len(self.block_dp_storage.items)
         block_id = count()
 
         while True:
-            if init_block_nr >= self.env.config["resource_master.block.init_amount"]:
+            if cur_block_nr > self.env.config["resource_master.block.init_amount"]:
                 yield self.env.timeout(self.env.config["resource_master.block.arrival_interval"])
-            else:
-                init_block_nr += 1
+
+            elif cur_block_nr < self.env.config["resource_master.block.init_amount"]:
+                cur_block_nr += 1
+
+            elif cur_block_nr == self.env.config["resource_master.block.init_amount"]:
+                cur_block_nr += 1
+                self.init_block_ready.succeed()
+                yield self.env.timeout(self.env.config["resource_master.block.arrival_interval"])
+
             # yield block_id
             cur_block_id = next(block_id)
             total_dp = self.env.config['resource_master.block.init_epsilon']
@@ -348,14 +358,16 @@ class ResourceMaster(Component):
             block_item = {
                 "dp_container": new_block,
                 # lifetime :=  # of periods from born to end
-                "end_of_life": self.env.now + self.env.config['resource_master.block.lifetime'] - 1,
+                "end_of_life": self.env.now + self.env.config[
+                    'resource_master.allocation_policy.rate_policy.lifetime'] - 1,
                 "accum_containers": dict(),  # task_id: container
+                'is_dead': False
             }
             yield self.block_dp_storage.put(block_item)
-            self.unused_dp.put(total_dp)
+            yield self.unused_dp.put(total_dp)
             # self.debug(block_id, "new data block created")
             # self.block_waiting_containers.append([])
-            if self.policy == RATE_LIMIT_POLICY:
+            if self.policy == POLICY_RATE_LIMIT:
                 self.env.process(self.rate_release_dp(cur_block_id))
 
     def _commit_dp_allocation(self, block_idx: List[int], epsilon: float):
@@ -368,6 +380,7 @@ class ResourceMaster(Component):
         Returns:
 
         """
+        assert len(block_idx) > 0
         for i in block_idx:
             try:
                 assert self.block_dp_storage.items[i]["dp_container"].capacity >= epsilon
@@ -390,17 +403,32 @@ class ResourceMaster(Component):
                 vcd.parse(vcd_file)
                 root_data = vcd.scope.toJson()
                 assert root_data['children'][0]['children'][2]['name'] == "cpu_pool"
-                # at least 10 sample
-                assert len(root_data['children'][0]['children'][2]['data']) > 10
+                # at least 11 sample
+                if len(root_data['children'][0]['children'][2]['data']) == 0:
+                    result['CPU_utilization%'] = 0
+                    return
+                elif len(root_data['children'][0]['children'][2]['data']) <= 10:
+                    self.debug("WARNING: CPU change sample size <= 10")
                 idle_cpu_record = map(lambda t: (t[0], eval('0' + t[1])),
                                       root_data['children'][0]['children'][2]['data'])
+                ## todo
+
+                idle_cpu_record = list(idle_cpu_record)
+
+                if idle_cpu_record[0][0] != 0:
+                    idle_cpu_record = [(0, cpu_capacity)] + idle_cpu_record
+
+                assert self.env.config['sim.timescale'] == self.env.config['sim.duration'].split(' ')[1]
+                end_tick = int(self.env.config['sim.duration'].split(' ')[0]) - 1
+                if idle_cpu_record[-1][0] != end_tick:
+                    idle_cpu_record = idle_cpu_record + [(end_tick, idle_cpu_record[-1][1])]
+
                 t1, t2 = tee(idle_cpu_record)
                 next(t2)
-                cpu_util_time = map(lambda t: (cpu_capacity - t[0][1]) * (t[1][0] - t[0][0]), zip(t1, t2))
+                busy_cpu_time = map(lambda t: (cpu_capacity - t[0][1]) * (t[1][0] - t[0][0]), zip(t1, t2))
 
             # cal over start and end
-            result['CPU_utilization%'] = 100 * sum(cpu_util_time) / root_data['children'][0]['children'][2]['data'][-1][
-                0]
+            result['CPU_utilization%'] = 100 * sum(busy_cpu_time) / (end_tick + 1) / cpu_capacity
 
 
 class Tasks(Component):
@@ -454,10 +482,24 @@ class Tasks(Component):
         else:
             self.db = None
 
-        self.cpu_dist = partial(self.env.rand.randint, 1, self.env.config['task.demand.num_cpu.max'])
-        self.memory_dist = partial(self.env.rand.randint, 1, self.env.config['task.demand.size_memory.max'])
-        self.gpu_dist = partial(self.env.rand.randint, 1, self.env.config['task.demand.num_gpu.max'])
-        self.completion_time_dist = partial(self.env.rand.randint, 1, self.env.config['task.completion_time.max'])
+        # todo use setdefault()
+        num_cpu_min = 1 if "task.demand.num_cpu.min" not in self.env.config else self.env.config[
+            'task.demand.num_cpu.min']
+        self.cpu_dist = partial(self.env.rand.randint, num_cpu_min, self.env.config['task.demand.num_cpu.max'])
+
+        size_memory_min = 1 if "task.demand.size_memory.min" not in self.env.config else self.env.config[
+            'task.demand.size_memory.min']
+        self.memory_dist = partial(self.env.rand.randint, size_memory_min,
+                                   self.env.config['task.demand.size_memory.max'])
+
+        num_gpu_min = 1 if "task.demand.num_gpu.min" not in self.env.config else self.env.config[
+            'task.demand.num_gpu.min']
+        self.gpu_dist = partial(self.env.rand.randint, num_gpu_min, self.env.config['task.demand.num_gpu.max'])
+
+        completion_time_min = 1 if "task.completion_time.min" not in self.env.config else self.env.config[
+            'task.completion_time.min']
+        self.completion_time_dist = partial(self.env.rand.randint, completion_time_min,
+                                            self.env.config['task.completion_time.max'])
 
         self.epsilon_dist = partial(
             self.env.rand.uniform, 0, self.env.config['resource_master.block.init_epsilon'] / self.env.config[
@@ -482,9 +524,10 @@ class Tasks(Component):
         arrival_interval_dist = partial(
             self.env.rand.expovariate, 1 / self.env.config['task.arrival_interval']
         )
+        ## wait for generating init blocks
 
+        yield self.resource_master.init_block_ready
         while True:
-            ## wait for generating init blocks
             yield self.env.timeout(arrival_interval_dist())
             t_id = next(task_id)
 
@@ -506,6 +549,7 @@ class Tasks(Component):
         t0 = self.env.now
         # query existing data blocks
         num_stored_blocks = len(self.resource_master.block_dp_storage.items)
+        assert(num_stored_blocks > 0)
         num_blocks_demand = min(max(1, round(self.num_blocks_dist())), num_stored_blocks)
 
         self.debug(task_id, 'DP demand epsilon=%.3f for %d blocks' % (epsilon, num_blocks_demand))
@@ -517,6 +561,7 @@ class Tasks(Component):
             "memory": self.memory_dist(),
             "gpu": self.gpu_dist(),
             "epsilon": epsilon,
+            # fixme maybe exclude EOL blocks?
             "block_idx": list(range(num_stored_blocks))[-num_blocks_demand:],  # choose latest num_blocks_demand
             "completion_time": self.completion_time_dist(),
             "allocation_done_event": allocation_done_event,
@@ -607,25 +652,30 @@ from (
             'SELECT MAX(dp_allocation_duration) FROM tasks WHERE completion_time IS NOT NULL'
         ).fetchone()[0]
 
-        result['dp_allocation_duration_P99'] = self.db.execute(
-            sql_percentile % 2
-        ).fetchone()[0]
-
-        result['dp_allocation_duration_P99'] = self.db.execute(
-            sql_percentile % 100
-        ).fetchone()[0]
-
-        result['dp_allocation_duration_P999'] = self.db.execute(
-            sql_percentile % 1000
-        ).fetchone()[0]
-
-        result['dp_allocation_duration_P9999'] = self.db.execute(
-            sql_percentile % 10000
-        ).fetchone()[0]
-
         result['succeed_tasks_total'] = self.db.execute(
             'SELECT COUNT() FROM tasks  WHERE completion_time IS NOT NULL'
         ).fetchone()[0]
+
+        if result['succeed_tasks_total'] >= 2:
+
+            result['dp_allocation_duration_Median'] = self.db.execute(
+                sql_percentile % 2
+            ).fetchone()[0]
+
+        if result['succeed_tasks_total'] >= 100:
+            result['dp_allocation_duration_P99'] = self.db.execute(
+                sql_percentile % 100
+            ).fetchone()[0]
+
+        if result['succeed_tasks_total'] >= 1000:
+            result['dp_allocation_duration_P999'] = self.db.execute(
+                sql_percentile % 1000
+            ).fetchone()[0]
+
+        if result['succeed_tasks_total'] >= 10000:
+            result['dp_allocation_duration_P9999'] = self.db.execute(
+                sql_percentile % 10000
+            ).fetchone()[0]
 
         result['succeed_tasks_per_hour'] = result['succeed_tasks_total'] / (
                 self.env.time() / 3600
@@ -634,29 +684,30 @@ from (
 
 if __name__ == '__main__':
     config = {
-        'bagger.bag_time': 1.5,
-        'bagger.policy': 'float-aggressive',
-        'cashier.bag_time': 2.0,
-        'cashier.scan_time': 2.0,
-        'checkout.bag_area_capacity': 15,
-        'checkout.feed_capacity': 20,
 
-        'task.arrival_interval': 20,
-        'task.demand.num_blocks.mu': 6,
-        'task.demand.num_blocks.sigma': 5,
-        'task.demand.epsilon.mean_tasks_per_block': 3.0,
+        'task.arrival_interval': 10,
+        'task.demand.num_blocks.mu': 20,
+        'task.demand.num_blocks.sigma': 10,
+        'task.demand.epsilon.mean_tasks_per_block': 40,
 
         # max = half of capacity
-        'task.completion_time.max': 10,
+        'task.completion_time.max': 40 ,
+        # 'task.completion_time.min': 10,
+
         'task.demand.num_cpu.max': 4,
+        'task.demand.num_cpu.min': 1,
+
         'task.demand.size_memory.max': 412,
+        'task.demand.size_memory.min': 1,
+
         'task.demand.num_gpu.max': 4,
+        'task.demand.num_gpu.min': 1,
 
         'resource_master.block.init_epsilon': 5.0,
-        'resource_master.block.init_amount': 50,
-        'resource_master.block.arrival_interval': 120,
-        'resource_master.block.lifetime': 300,
-        'resource_master.allocation_policy': RATE_LIMIT_POLICY,
+        'resource_master.block.init_amount': 20,
+        'resource_master.block.arrival_interval': 100,
+        'resource_master.allocation_policy.rate_policy.lifetime': 300,
+        'resource_master.allocation_policy': POLICY_RATE_LIMIT,
         # 'resource_master.allocation_policy': FCFS_POLICY,
 
         # https://cloud.google.com/compute/docs/gpus
@@ -666,15 +717,13 @@ if __name__ == '__main__':
         'resource_master.memory_capacity': 624,  # in GB, assume granularity is 1GB
         'resource_master.gpu_capacity': 8,  # in cards
 
-        'grocery.num_baggers': 1,
-        'grocery.num_lanes': 2,
         'sim.db.enable': True,
         'sim.db.persist': True,
         'sim.dot.colorscheme': 'blues5',
         'sim.dot.enable': True,
-        'sim.duration': '100000 s',
+        'sim.duration': '500000 s',
         'sim.gtkw.file': 'sim.gtkw',
-        'sim.gtkw.live': True,
+        'sim.gtkw.live': False,
         'sim.log.enable': True,
         "sim.log.level": "DEBUG",
         'sim.progress.enable': True,
@@ -685,6 +734,8 @@ if __name__ == '__main__':
         'sim.vcd.enable': True,
         'sim.vcd.persist': True,
         'sim.workspace': 'workspace',
+        'sim.workspace.overwrite': True,
+
     }
 
     parser = ArgumentParser()
@@ -714,4 +765,70 @@ if __name__ == '__main__':
     if factors:
         simulate_factors(config, factors, Top)
     else:
-        simulate(config, Top)
+        pass
+        # simulate(config, Top)
+
+    task_configs = {}
+    scheduler_configs = {}
+
+
+    demand_block_num_baseline = config['task.demand.epsilon.mean_tasks_per_block'] * config['task.arrival_interval'] / config['resource_master.block.arrival_interval']
+    demand_block_num_low_factor = 1
+    task_configs["high_cpu_low_dp"] = {'task.demand.num_cpu.max': config["resource_master.cpu_capacity"],
+                                       'task.demand.num_cpu.min': 2,
+                                       'task.demand.epsilon.mean_tasks_per_block': 200,
+                                       'task.demand.num_blocks.mu': demand_block_num_baseline * demand_block_num_low_factor, # 3
+                                       'task.demand.num_blocks.sigma': demand_block_num_baseline * demand_block_num_low_factor,
+                                       }
+    task_configs["low_cpu_high_dp"] = {'task.demand.num_cpu.max': 2,
+                                       'task.demand.num_cpu.min': 1,
+                                       'task.demand.epsilon.mean_tasks_per_block': 8,
+                                       'task.demand.num_blocks.mu': demand_block_num_baseline * demand_block_num_low_factor * 4, # 45
+                                       'task.demand.num_blocks.sigma': demand_block_num_baseline * demand_block_num_low_factor * 4 / 3, # 5
+                                       }
+
+    scheduler_configs["fcfs_policy"] = {'resource_master.allocation_policy': POLICY_FCFS}
+
+    scheduler_configs["rate_policy_slow_release"] = {'resource_master.allocation_policy': POLICY_RATE_LIMIT,
+                                                     'resource_master.allocation_policy.rate_policy.lifetime': config[
+                                                                                                                   'task.arrival_interval'] * 10 * 5 # 500
+                                                     }
+    scheduler_configs["rate_policy_fast_release"] = {'resource_master.allocation_policy': POLICY_RATE_LIMIT,
+                                                     'resource_master.allocation_policy.rate_policy.lifetime': config[
+                                                                                                                   'task.arrival_interval'] * 5} # 50
+    dp_factor_names = set()
+    for sched_conf_k, sched_conf_v in scheduler_configs.items():
+        for conf_factor in sched_conf_v:
+            dp_factor_names.add(conf_factor)
+
+    for task_conf_k, task_conf_v in task_configs.items():
+        for conf_factor in task_conf_v:
+            dp_factor_names.add(conf_factor)
+    dp_factor_names = list(dp_factor_names)
+    dp_factor_values = []
+
+    configs = []
+
+    config2 = config.copy()
+    config2["sim.workspace"] = "workspace_copy"
+    configs.append(config2)
+
+    for sched_conf_k, sched_conf_v in scheduler_configs.items():
+        for task_conf_k, task_conf_v in task_configs.items():
+            new_config = config.copy()
+            new_config.update(sched_conf_v)
+            new_config.update(task_conf_v)
+            workspace_name = "workspace_%s-%s" % (sched_conf_k, task_conf_k)
+            new_config["sim.workspace"] = workspace_name
+            configs.append(new_config)
+
+
+    simulate_many(configs, Top)
+
+    # debug a config
+    # for cfg in configs:
+    #     # if "slow_release-low_cpu_high_dp"in cfg["sim.workspace"]:
+    #     #     simulate(cfg, Top)
+    #
+    #     if "fast_release-low_cpu_high_dp"in cfg["sim.workspace"]:
+    #         simulate(cfg, Top)
