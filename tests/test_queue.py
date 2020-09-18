@@ -1,6 +1,6 @@
 from pytest import raises
 
-from desmod.queue import PriorityItem, PriorityQueue, Queue
+from desmod.queue import PriorityItem, PriorityQueue, Queue, FilterQueue
 
 
 def test_mq(env):
@@ -82,6 +82,27 @@ def test_mq_when_full(env):
     assert queue.is_full
     assert 'full' in result
     assert result.count('any') == 2
+
+def test_filter_mq(env):
+    queue = FilterQueue(env)
+
+    def producer(env):
+        for i in range(1,11):
+            item = {'idx':i }
+            yield queue.put(item)
+            yield env.timeout(1)
+
+    def consumer(env):
+        yield env.timeout(11)
+        for i in (2,3,5,7):
+            item = yield queue.get(filter=lambda x: x['idx'] % i == 0)
+            assert item['idx'] == i
+            yield env.timeout(1)
+
+    env.process(producer(env))
+    env.process(consumer(env))
+    env.run()
+
 
 
 def test_priority_mq(env):

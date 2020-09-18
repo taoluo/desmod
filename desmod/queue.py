@@ -373,3 +373,61 @@ class PriorityQueue(Queue[ItemType]):
 
     def _dequeue_item(self) -> ItemType:
         return heappop(self.items)
+
+# usage: get by task id
+class FilterQueueGet(QueueGetEvent):
+    """Request to get an *item* from the *store* matching the *filter*. The
+    request is triggered once there is such an item available in the store.
+
+    *filter* is a function receiving one item. It should return ``True`` for
+    items matching the filter criterion. The default function returns ``True``
+    for all items, which makes the request to behave exactly like
+    :class:`StoreGet`.
+
+    """
+
+    def __init__(
+        self,
+        queue: 'Queue[ItemType]',
+        filter: Callable[[Any], bool] = lambda item: True,
+    ):
+        self.filter = filter
+        """The filter function to filter items in the store."""
+        # trigger get in init
+        super().__init__(queue)
+
+
+class FilterQueue(Queue[ItemType]):
+    """Specialized queue where items are dequeued in priority order.
+
+    Items in `PriorityQueue` must be orderable (implement
+    :meth:`~object.__lt__`). Unorderable items may be used with `PriorityQueue`
+    by wrapping with :class:`~PriorityItem`.
+
+    Items that evaluate less-than other items will be dequeued first.
+
+    """
+
+
+    if TYPE_CHECKING:
+        def get(self,filter: Callable[[Any], bool] = lambda item: True) -> FilterQueueGet:
+            """Dequeue an item from the queue."""
+            ...
+    else:
+        get = BoundClass(FilterQueueGet)
+
+    def _trigger_get(self, _: Optional[Event] = None) -> None:
+
+        idx = 0
+        while self._get_waiters and idx < len(self._get_waiters):
+            get_ev = self._get_waiters[idx]
+            for i,item in enumerate(self.items):
+                if get_ev.filter(item):
+                    self.items.pop(i)
+                    self._get_waiters.pop(idx)
+                    get_ev.succeed(item)
+                    if self._get_hook:
+                        self._get_hook()
+                    break
+            else:
+                idx +=1
