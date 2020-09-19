@@ -200,13 +200,13 @@ class ResourceMaster(Component):
             # print('new task arrived')
 
             new_task_dict = self.waiting_tasks.items[-1]
-            assert new_task_dict['dominant_resource_share'] > 0
+            assert new_task_dict['dominant_resource_share'] is None
             new_task_id = new_task_dict['task_id']
 
             incremented_quota_idx = set(self.task_state[new_task_id]["resource_request"]['block_idx']) - set(self.task_state[new_task_id]['retired_blocks'])
 
-            # omit update DRS of last new task
-            for t in self.waiting_tasks.items[:-1]:
+            # should update DRS of last new task
+            for t in self.waiting_tasks.items:
                 t_id = t['task_id']
                 # update DRS
                 if set(self.task_state[t_id]["resource_request"]['block_idx']) & incremented_quota_idx:
@@ -219,12 +219,14 @@ class ResourceMaster(Component):
 
             # iterate over tasks ordered by DRS, match quota, allocate.
             for t in sorted(self.waiting_tasks.items,reverse=False,key = lambda x:x['dominant_resource_share']):
+                assert t['dominant_resource_share'] is not None
                 t_id = t['task_id']
                 this_task = self.task_state[t['task_id']]
                 # self.debug(t_id, "DRS: %.3f" % t['dominant_resource_share'])
                 for b_idx in range(len(self.block_dp_storage.items)):
                     if self.block_dp_storage.items[b_idx]['dp_quota'].level < self.task_state[t_id]["resource_request"]['epsilon']:
                         if self.block_dp_storage.items[b_idx]['is_retired'] and this_task["handler_proc"]._value is PENDING:
+                            yield self.waiting_tasks.get(filter=lambda item: item['task_id'] == t['task_id'])
                             this_task["handler_proc"].interrupt("task is failed, because block %d is retired" % b_idx)
                         break
                 else:
@@ -269,7 +271,6 @@ class ResourceMaster(Component):
                         self.task_state[msg["task_id"]]["accum_containers"][i] = cn
                         self.block_dp_storage.items[i]["accum_containers"][msg['task_id']] = cn
                 elif self.is_policy_drf:
-                    scaled_resource_shares = []
                     for i in msg["block_idx"]:
                         self.block_dp_storage.items[i]["arrived_task_num"] += 1
                         if not self.block_dp_storage.items[i]["is_retired"]:
@@ -280,19 +281,14 @@ class ResourceMaster(Component):
                             aa = yield self.env.timeout(1,value=TIMEOUT_VAL) | self.block_dp_storage.items[i]['dp_quota'].put(quota_increment)
                             if aa == TIMEOUT_VAL:
                                 raise (ShouldTriggeredImmediatelyException("non-retired block cannot add quota"))
-                            # cal new DRS
-                            rs = msg["epsilon"]/(self.env.config["resource_master.block.init_epsilon"] - self.block_dp_storage.items[i]['dp_container'].level)
-                            scaled_resource_shares.append(rs)
 
                             if self.block_dp_storage.items[i]["arrived_task_num"] == self.denom:
                                 self.block_dp_storage.items[i]["is_retired"] = True
                         else:
                             self.task_state[msg["task_id"]]['retired_blocks'].append(i)
-                            rs = msg["epsilon"] / self.env.config["resource_master.block.init_epsilon"]
-                            scaled_resource_shares.append(rs)
 
                     yield self.waiting_tasks.put({'task_id':msg["task_id"],
-                                                'dominant_resource_share': max(scaled_resource_shares)})
+                                                'dominant_resource_share': None})
 
 
 
@@ -315,20 +311,10 @@ class ResourceMaster(Component):
                 allocation_done_event.fail(
                     InsufficientDpException("Block ID: %d, remain epsilon: %.3f" % (i, capacity)))
                 return
-        # getevent: blk_idx
-        # specify where should DP be retrieved
-        get_dp_events = dict()
-        # for i in resource_demand["block_idx"]:
-        #     if self.policy == POLICY_FCFS:
-        #         get_dp_events[self.block_dp_storage.items[i]["dp_container"].get(resource_demand["epsilon"])] = i
-        #     elif self.policy == POLICY_RATE_LIMIT:
-        #         get_dp_events[this_task['accum_containers'][i].get(resource_demand["epsilon"])] = i
-        #     elif self.policy == POLICY_DYNAMIC_DRF:
-        #         get_dp_events[self.block_dp_storage.items[i]["dp_quota"].get(resource_demand["epsilon"])] = i
-        # for i in resource_demand["block_idx"]:
-        #     get_dp_events[this_task['accum_containers'][i].get(resource_demand["epsilon"])] = i
 
-        # wait for granting DP
+        # getevent: blk_idx
+        get_dp_events = dict()
+
         if self.is_policy_fcfs:
             for i in resource_demand["block_idx"]:
                 get_dp_events[self.block_dp_storage.items[i]["dp_container"].get(resource_demand["epsilon"])] = i
@@ -357,18 +343,9 @@ class ResourceMaster(Component):
                 yield self.env.all_of(get_dp_events)
             except simpy.Interrupt as e:
                 self.debug(task_id, e)
-                allocation_done_event.fail(RejectAllocException("request DP interrupted"))
-                # return DP to block
-                # haven't issue get to quota
+                # should not issue get to quota
                 assert len(get_dp_events) == 0
-                # for get_event, blk_idx in get_dp_events.items():
-                #     # level reduced
-                #     if get_event.triggered:
-                #         self.block_dp_storage.items[blk_idx]["dp_quota"].put(get_event.amount)
-                #     else:
-                #         get_event.cancel()
-
-
+                allocation_done_event.fail(RejectAllocException("request DP interrupted"))
                 return
 
         # more complicated, handling rejection, return dp etc.
