@@ -10,3 +10,11 @@ setuptools_scm
 Sphinx
 sphinx-rtd-theme
 tox
+; for save gtkwave png
+path
+EasyProcess
+pyvirtualdisplay
+pyscreenshot
+pillow
+docutils
+Sphinx

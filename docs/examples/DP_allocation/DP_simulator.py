@@ -149,7 +149,7 @@ class ResourceMaster(Component):
 
         self.block_dp_storage = Queue(self.env, capacity=float("inf"))
         # self.block_waiting_containers = [] # [[],[],...,[] ], put each task's waiting DP container in sublist
-        self.is_cpu_limited_only = self.env.config['resource_master.is_cpu_limited_only']
+        self.is_cpu_needed_only = self.env.config['resource_master.is_cpu_needed_only']
         self.cpu_pool = Pool(self.env, capacity=self.env.config["resource_master.cpu_capacity"],
                              init=self.env.config["resource_master.cpu_capacity"], hard_cap=True)
         self.auto_probe('cpu_pool', vcd={})
@@ -253,7 +253,9 @@ class ResourceMaster(Component):
                 self.task_state[msg["task_id"]]["dp_commit_time"] = None
                 self.task_state[msg["task_id"]]["is_dp_granted"] = False
 
-                self.task_state[msg["task_id"]]["allocation_done_event"] = msg.pop("allocation_done_event")
+                self.task_state[msg["task_id"]]["resource_allocated_event"] = msg.pop("resource_allocated_event")
+                self.task_state[msg["task_id"]]["dp_committed_event"] = msg.pop("dp_committed_event")
+
                 self.task_state[msg["task_id"]]["task_completion_event"] = self.env.event()
                 self.task_state[msg["task_id"]]["grant_dp_ready_evt"] = self.env.event()
                 self.task_state[msg["task_id"]]["retired_blocks"] = [] if self.is_policy_drf else None
@@ -300,7 +302,9 @@ class ResourceMaster(Component):
     def task_handler(self, task_id):
         self.debug(task_id, "Task handler created")
         this_task = self.task_state[task_id]
-        allocation_done_event = this_task["allocation_done_event"]
+        resource_allocated_event = this_task["resource_allocated_event"]
+        dp_committed_event = this_task["dp_committed_event"]
+
         resource_demand = this_task["resource_request"]
         task_completion_event = this_task["task_completion_event"]
         # peek remaining DP
@@ -308,7 +312,7 @@ class ResourceMaster(Component):
             capacity = self.block_dp_storage.items[i]["dp_container"].capacity
             if capacity < resource_demand["epsilon"]:
                 self.debug(task_id, "InsufficientDpException, Block ID: %d, remain epsilon: %.3f" % (i, capacity))
-                allocation_done_event.fail(
+                dp_committed_event.fail(
                     InsufficientDpException("Block ID: %d, remain epsilon: %.3f" % (i, capacity)))
                 return
 
@@ -322,7 +326,7 @@ class ResourceMaster(Component):
                 yield self.env.all_of(get_dp_events)
             except simpy.Interrupt as e:
                 self.debug(task_id, "request DP interrupted")
-                allocation_done_event.fail(RejectAllocException("request DP interrupted"))
+                dp_committed_event.fail(RejectAllocException("request DP interrupted"))
                 # return DP to block
                 for get_event, blk_idx in get_dp_events.items():
                     # level reduced
@@ -345,7 +349,7 @@ class ResourceMaster(Component):
                 self.debug(task_id, e)
                 # should not issue get to quota
                 assert len(get_dp_events) == 0
-                allocation_done_event.fail(RejectAllocException("request DP interrupted"))
+                dp_committed_event.fail(RejectAllocException("request DP interrupted"))
                 return
 
         # more complicated, handling rejection, return dp etc.
@@ -370,7 +374,7 @@ class ResourceMaster(Component):
 
             except simpy.Interrupt as e:
                 self.debug(task_id, "request DP interrupted")
-                allocation_done_event.fail(RejectAllocException("request DP interrupted"))
+                dp_committed_event.fail(RejectAllocException("request DP interrupted"))
 
                 for blk_idx in resource_demand["block_idx"]:
                     # pop, stop task's all waiting container
@@ -399,9 +403,10 @@ class ResourceMaster(Component):
         yield from self._commit_dp_allocation(resource_demand["block_idx"], epsilon=resource_demand["epsilon"])
         self.task_state[task_id]["is_dp_granted"] = True
         self.task_state[task_id]["dp_commit_time"] = self.env.now
+        dp_committed_event.succeed()
 
         get_cpu_event = self.cpu_pool.get(resource_demand["cpu"])
-        if not self.is_cpu_limited_only:
+        if not self.is_cpu_needed_only:
             get_memory_event = self.memory_pool.get(resource_demand["memory"])
             get_gpu_event = self.gpu_pool.get(resource_demand["gpu"])
 
@@ -409,12 +414,12 @@ class ResourceMaster(Component):
         else:
             yield get_cpu_event
 
-        allocation_done_event.succeed()
+        resource_allocated_event.succeed()
 
         yield task_completion_event
 
         put_cpu_event = self.cpu_pool.put(resource_demand["cpu"])
-        if not self.is_cpu_limited_only:
+        if not self.is_cpu_needed_only:
             put_gpu_event = self.gpu_pool.put(resource_demand["gpu"])
             put_memory_event = self.memory_pool.put(resource_demand["memory"])
 
@@ -611,7 +616,9 @@ class Tasks(Component):
         super().__init__(*args, **kwargs)
         self.add_connections('resource_master')
         self.add_process(self.generate_tasks)
-        self.active_count = Container(self.env)
+        self.unpublished_count = Container(self.env)
+        self.running_count = Container(self.env)
+
         self.auto_probe('active_count', vcd={})
 
         self.completion_count = Container(self.env)
@@ -645,7 +652,12 @@ class Tasks(Component):
         # todo use setdefault()
         num_cpu_min = 1 if "task.demand.num_cpu.min" not in self.env.config else self.env.config[
             'task.demand.num_cpu.min']
-        self.cpu_dist = partial(self.env.rand.randint, num_cpu_min, self.env.config['task.demand.num_cpu.max'])
+        if self.env.config['task.demand.num_cpu.constant']:
+            self.debug("task cpu demand is fix %d " % self.env.config['task.demand.num_cpu.constant'])
+            assert isinstance(self.env.config['task.demand.num_cpu.constant'], int)
+            self.cpu_dist = lambda : self.env.config['task.demand.num_cpu.constant']
+        else:
+            self.cpu_dist = partial(self.env.rand.randint, num_cpu_min, self.env.config['task.demand.num_cpu.max'])
 
         size_memory_min = 1 if "task.demand.size_memory.min" not in self.env.config else self.env.config[
             'task.demand.size_memory.min']
@@ -658,7 +670,11 @@ class Tasks(Component):
 
         completion_time_min = 1 if "task.completion_time.min" not in self.env.config else self.env.config[
             'task.completion_time.min']
-        self.completion_time_dist = partial(self.env.rand.randint, completion_time_min,
+        if self.env.config['task.completion_time.constant']:
+            self.debug("task completion time is fixed %d" % self.env.config['task.completion_time.constant'])
+            self.completion_time_dist = lambda : self.env.config['task.completion_time.constant']
+        else:
+            self.completion_time_dist = partial(self.env.rand.randint, completion_time_min,
                                             self.env.config['task.completion_time.max'])
 
         self.epsilon_dist = partial(
@@ -701,7 +717,7 @@ class Tasks(Component):
 
     def task(self, task_id):
         """Grocery store customer behavior."""
-        yield self.active_count.put(1)
+        yield self.unpublished_count.put(1)
         epsilon = self.epsilon_dist()
         # yield self.env.timeout(epsilon)
         # self.debug(task_id, 'ready to checkout after', timedelta(seconds=epsilon))
@@ -713,7 +729,9 @@ class Tasks(Component):
         num_blocks_demand = min(max(1, round(self.num_blocks_dist())), num_stored_blocks)
 
         self.debug(task_id, 'DP demand epsilon=%.3f for %d blocks' % (epsilon, num_blocks_demand))
-        allocation_done_event = self.env.event()
+        resource_allocated_event = self.env.event()
+        dp_committed_event = self.env.event()
+
         resource_request_msg = {
             "message_type": ALLOCATION_REQUEST,
             "task_id": task_id,
@@ -724,18 +742,21 @@ class Tasks(Component):
             # fixme maybe exclude EOL blocks?
             "block_idx": list(range(num_stored_blocks))[-num_blocks_demand:],  # choose latest num_blocks_demand
             "completion_time": self.completion_time_dist(),
-            "allocation_done_event": allocation_done_event,
+            "resource_allocated_event": resource_allocated_event,
+            "dp_committed_event": dp_committed_event,
             "user_id": None,
             "model_id": None}
 
         yield self.resource_master.mail_box.put(resource_request_msg)
-
-        # wait for allocation
+        def run_task():
+            yield
+        self.env.process(run_task())
+        dp_committed_event
+                # wait for allocation
         try:
+            # resource_allocated_event = self.resource_master.task_state[task_id]["resource_allocated_event"]
 
-            # allocation_done_event = self.resource_master.task_state[task_id]["allocation_done_event"]
-
-            yield allocation_done_event
+            yield resource_allocated_event
             dp_allocation_time = self.resource_master.task_state[task_id]["dp_commit_time"]
 
             alloc_done_time = self.env.now
@@ -761,7 +782,7 @@ class Tasks(Component):
             self.debug(task_id, 'Allocation failed after', timedelta(seconds=allocation_rej_duration))
             self.fail_count.put(1)
 
-        yield self.active_count.get(1)
+        yield self.unpublished_count.get(1)
         if self.db:
             self.db.execute(
                 'INSERT INTO tasks '
@@ -775,7 +796,7 @@ class Tasks(Component):
         return
 
         # todo, async compute while wait for DP allocation??
-        # yield self.env.all_of([self.env.timeout(self.env.config['task.completion_time.max']), allocation_done_event])
+        # yield self.env.all_of([self.env.timeout(self.env.config['task.completion_time.max']), resource_allocated_event])
 
     def get_result_hook(self, result):
         if not self.db:
@@ -850,10 +871,11 @@ if __name__ == '__main__':
         'task.demand.num_blocks.sigma': 10,
         'task.demand.epsilon.mean_tasks_per_block': 16,
 
+        'task.completion_time.constant': 1,
         # max = half of capacity
         'task.completion_time.max': 40 ,
         # 'task.completion_time.min': 10,
-
+        'task.demand.num_cpu.constant': 1, # [min, max]
         'task.demand.num_cpu.max': 4,
         'task.demand.num_cpu.min': 1,
 
@@ -874,7 +896,7 @@ if __name__ == '__main__':
         'resource_master.allocation_policy.dynamic_drf.denominator': 20,
         # https://cloud.google.com/compute/docs/gpus
         # V100 VM instance
-        'resource_master.is_cpu_limited_only': True,
+        'resource_master.is_cpu_needed_only': True,
         'resource_master.cpu_capacity': 96,  # number of cores
         'resource_master.memory_capacity': 624,  # in GB, assume granularity is 1GB
         'resource_master.gpu_capacity': 8,  # in cards

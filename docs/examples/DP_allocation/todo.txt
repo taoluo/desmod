@@ -1,0 +1,14 @@
+# 99 percentile
+# vcd cpu
+epsilon dist
+max-min release
+save gtkwave screenshot by script
+    gtkw.zoom_markers()
+    zoom scale?? how , marker position
+    10**(-9.641838) = 0.23 = 1153 / 5000
+    1153 <- 1853  // [size] 1853 1143
+
+    gtkw.timestart()
+
+# trigger new event in put hook
+PLOT: try to put config param in gtkwave.
