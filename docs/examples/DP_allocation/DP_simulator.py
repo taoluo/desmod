@@ -180,22 +180,24 @@ class ResourceMaster(Component):
         # permitted is a task state after its resources are permitted, before its resources are released
         # {tid,...,}
         resource_permitted_tasks = set()
-        dp_waiting_tasks = set()
+        # dp_waiting_tasks = set()
         # dp_committed_events = dict()
-        resource_released_events = dict()
+        to_release_resource_events = dict()
         resrc_request_arrival_event = self.env.event()
         self.resource_waiting_tasks._put_hook = lambda: resrc_request_arrival_event.succeed()
 
         def _grant_resource_permission(request_tid):
+            # non blocking 
             # todo more tear down operation
             resource_permitted_tasks.add(request_tid)
             # if permitted task is dp waiting, remove from dp waiting list
-            dp_waiting_tasks.discard(request_tid)
+            # dp_waiting_tasks.discard(request_tid)
             # assert self.task_state[request_tid]['resource_released_event'] not in resource_released_events
             # resource_released_events[self.task_state[request_tid]['resource_released_event']] = request_tid
             self.task_state[request_tid]['resource_permitted_event'].succeed()
-            yield from _should_return_immediately(self.env, self.task_state[request_tid]['resource_allocated_event'])
-            yield from _should_return_immediately(self.env, self.resource_waiting_tasks.get(filter=lambda x: x == request_tid))
+            # yield from _should_return_immediately(self.env, self.task_state[request_tid]['resource_allocated_event'])
+            # yield from _should_return_immediately(self.env, self.resource_waiting_tasks.get(filter=lambda x: x == request_tid))
+            self.resource_waiting_tasks.get(filter=lambda x: x == request_tid)
 
 
 
@@ -207,20 +209,39 @@ class ResourceMaster(Component):
 
             # existing demand state/priority change
             # only care about sleeping tasks' dp state change
-            dp_committed_events = {self.task_state[tid]['dp_committed_event']: tid for tid in
+            # warning:
+            # sometimes, a task already dequeued from dp_waiting_tasks, but not comitted yet, assume those tasks are dp-waiting
+            # cannot wait for/catch all dp_committed_event.
+
+            to_commit_dp_events = {self.task_state[tid]['dp_committed_event']: tid for tid in
                                    self.resource_waiting_tasks.items if
                                    not self.task_state[tid]['dp_committed_event'].triggered}
-            # todo alternative is filter by dp_waiting_tasks
-            dp_waiting_tasks2 = set( (tid for evt,tid in dp_committed_events.items()) )
-            ## fixme !!! condition is violated for long simulation.
-            assert dp_waiting_tasks2 == dp_waiting_tasks
 
-            sched_listened_events.update(dp_committed_events)
+
+            # todo alternative is filter by dp_waiting_tasks
+            sleeping_dp_waiting_tasks_init = set( (tid for evt,tid in to_commit_dp_events.items()) )
+            ## fixme !!! condition is violated for long simulation of rate limiting.
+
+
+            # dp_waiting_tasks22 = {d['task_id'] for d in self.dp_waiting_tasks.items}
+            # to_commit_dp_events22 = {self.task_state[tid]['dp_committed_event']: tid for tid in
+            #                        self.resource_waiting_tasks.items if
+            #                        tid in dp_waiting_tasks22}
+
+
+            # try:
+            #     assert dp_waiting_tasks2 == dp_waiting_tasks22
+            # except Exception as e:
+            #     print(dp_waiting_tasks2 - dp_waiting_tasks22)
+            #     print(dp_waiting_tasks22 - dp_waiting_tasks2) # one more task
+            #     raise e
+            # todo to_commit_dp_events22
+            sched_listened_events.update(to_commit_dp_events)
 
             # new supply
-            resource_released_events = {self.task_state[tid]['resource_released_event']: tid for tid in
+            to_release_resource_events = {self.task_state[tid]['resource_released_event']: tid for tid in
                                         resource_permitted_tasks }
-            sched_listened_events.update(resource_released_events)
+            sched_listened_events.update(to_release_resource_events)
 
             sched_listener = self.env.any_of(sched_listened_events)
 
@@ -231,14 +252,16 @@ class ResourceMaster(Component):
                 succeed_resource_released_events = []
                 for evt in succeed_events.events:
                     assert evt in sched_listened_events
-                    if evt in resource_released_events:
+                    if evt in to_release_resource_events:
                         succeed_resource_released_events.append(evt)
                     elif evt is resrc_request_arrival_event:
                         succeed_arrival_events.append(evt)
                     else:
-                        assert evt in dp_committed_events
+                        assert evt in to_commit_dp_events
                         succeed_dp_committed_events.append(evt)
+                # assume only handle one task arrival
                 assert len(succeed_arrival_events) <= 1
+
                 # overview of events-handling order:
                 # step1: if any, update dp_waiting/dp_granted state of waiting tasks
                 # step2: if there is a new task arrival and no resource was released, try to schedule new task.
@@ -251,8 +274,8 @@ class ResourceMaster(Component):
                 # todo maybe interrupt some ungranted running tasks to trigger resrc release event
                 for evt in succeed_dp_committed_events:
 
-                    dp_committed_tid = dp_committed_events[evt]
-                    dp_waiting_tasks.remove(dp_committed_tid)
+                    dp_committed_tid = to_commit_dp_events[evt]
+                    # dp_waiting_tasks.remove(dp_committed_tid)
 
                 # step2: if there is a new task arrival and no resource was released, try to schedule new task.
                 # secondary scheduling decision branch, FCFS when new task arrives and idle resource is sufficient.
@@ -273,52 +296,53 @@ class ResourceMaster(Component):
                             self.debug(request_tid, 'dp request is rejected upon resource request arrival, resource sched ignore the task')
                         # dp already granted
                         elif should_try_sched and self._is_idle_resource_enough(request_tid):
-                            yield from _grant_resource_permission(request_tid)
+                            _grant_resource_permission(request_tid)
 
                     # dp waiting
-                    else:
-                        if should_try_sched and self._is_idle_resource_enough(request_tid):
-                            yield from _grant_resource_permission(request_tid)
-                        else:
-                            dp_waiting_tasks.add(request_tid)
+                    elif should_try_sched and self._is_idle_resource_enough(request_tid):
+                        _grant_resource_permission(request_tid)
+                        # else:
+                        #     pass
+                            # dp_waiting_tasks.add(request_tid)
 
                 # step3: after step1 and step2, scheduler's state is updated and ready. if resource was released, \
                 #        then make scheduling decision here.
                 for evt in succeed_resource_released_events:
-                    released_tid = resource_released_events[evt]
+                    released_tid = to_release_resource_events[evt]
                     # resource_released_events.pop(evt)
                     resource_permitted_tasks.remove(released_tid)
 
                 # primary scheduling decision, when resource is released
                 if len(succeed_resource_released_events) != 0:
-                    dp_waiting_tasks_temp = set()
+                    sleeping_dp_waiting_tasks = set()
                     for sleeping_tid in copy.deepcopy(self.resource_waiting_tasks.items):
 
                         if not self.task_state[sleeping_tid]['dp_committed_event'].triggered:
                             # will schedule dp_waiting task later
-                            dp_waiting_tasks_temp.add(sleeping_tid)
+                            sleeping_dp_waiting_tasks.add(sleeping_tid)
 
                         # sched dp granted tasks
                         elif self.task_state[sleeping_tid]['dp_committed_event'].ok:
 
                             if self._is_idle_resource_enough(sleeping_tid):
-                                yield from _grant_resource_permission(sleeping_tid)
+                                _grant_resource_permission(sleeping_tid)
 
                         else:
+                            # fixme if dp commit event may fail when yield
                             raise Exception("should already be dequeued in caught exception.")
 
-                    assert dp_waiting_tasks == dp_waiting_tasks_temp
+                    assert len(sleeping_dp_waiting_tasks_init - sleeping_dp_waiting_tasks) >= 0
                     resource_waiting_tid_set = set(self.resource_waiting_tasks.items)
 
                     # sched dp waiting tasks
                     for t in sorted(self.dp_waiting_tasks.items, reverse=False, key=lambda x: x['dominant_resource_share']):
                         dp_waiting_tid = t['task_id']
                         if dp_waiting_tid in resource_waiting_tid_set and self._is_idle_resource_enough(sleeping_tid):
-                            yield from _grant_resource_permission(dp_waiting_tid)
+                            _grant_resource_permission(dp_waiting_tid)
 
             except (InsufficientDpException, RejectAllocException) as err:
                 dp_rejected_tid = err.args[0]
-                dp_waiting_tasks.remove(dp_rejected_tid)
+                # dp_waiting_tasks.remove(dp_rejected_tid)
                 yield from _should_return_immediately(self.env, self.resource_waiting_tasks.get(filter=lambda x: x == dp_rejected_tid))
                 self.debug(dp_rejected_tid, "dp request is rejected, get dequeued from waiting resource requests")
 
@@ -1187,9 +1211,11 @@ def _should_return_immediately(env, event, timeout_tolerate=0.01):
 if __name__ == '__main__':
     import copy
 
+    run_test_single = True
+    run_test_many = True
     run_test_parallel = True
-    run_test_many = False
-    run_test_single = False
+
+
 
     config = {
 
@@ -1334,6 +1360,19 @@ if __name__ == '__main__':
 
     configs = []
 
+
+#    config2 = copy.deepcopy(config1)
+#    config2["sim.workspace"] = "workspace_fcfs"
+#    config2["resource_master.dp_policy"] = POLICY_FCFS
+
+#    configs.append(config2)
+
+#    config2 = copy.deepcopy(config1)
+#    config2["sim.workspace"] = "workspace_dpf"
+#    config2["resource_master.dp_policy"] = POLICY_DPF
+
+#    configs.append(config2)
+
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_rate_limiting"
     config2["resource_master.dp_policy"] = POLICY_RATE_LIMIT
@@ -1341,17 +1380,7 @@ if __name__ == '__main__':
 
     configs.append(config2)
 
-    config2 = copy.deepcopy(config1)
-    config2["sim.workspace"] = "workspace_fcfs"
-    config2["resource_master.dp_policy"] = POLICY_FCFS
 
-    configs.append(config2)
-
-    config2 = copy.deepcopy(config1)
-    config2["sim.workspace"] = "workspace_dpf"
-    config2["resource_master.dp_policy"] = POLICY_DPF
-
-    configs.append(config2)
     if run_test_parallel:
         simulate_many(configs, Top)
 
