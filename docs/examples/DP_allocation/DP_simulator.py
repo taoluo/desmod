@@ -16,7 +16,8 @@ from datetime import timedelta
 from functools import partial
 from itertools import count, tee
 import simpy
-from simpy import Container, Resource, Store, FilterStore, Event
+# from simpy import Container, Resource, Store, FilterStore, Event
+from simpy.resources import base
 from simpy.events import PENDING
 from simpy.resources import store
 from vcd.gtkw import GTKWSave
@@ -48,14 +49,45 @@ ALLOCATION_FAIL = "F"
 ALLOCATION_REQUEST = "allocation_request"
 NEW_TASK = "new_task_created"
 # TASK_COMPLETION="task_completion"
-TASK_RESOURCE_RELEASED = "resource_release"
+# TASK_RESOURCE_RELEASED = "resource_release"
 
-POLICY_FCFS = "fcfs2342"
-POLICY_RATE_LIMIT = "rate123"
-POLICY_DPF = "dynamic_DPF234"
+DP_POLICY_FCFS = "fcfs2342"
+DP_POLICY_RATE_LIMIT = "rate123"
+DP_POLICY_DPF = "dynamic_DPF234"
 TIMEOUT_VAL = "timeout_triggered543535"
-NUMERICAL_DELTA = 1e-12
+# NUMERICAL_DELTA = 1e-12
+NUMERICAL_DELTA = 1e-2
 TIMEOUT_TOLERATE = 0.01
+class NoneBlockingPutMixin(object):
+    def put(self, *args, **kwargs):
+        event = super(NoneBlockingPutMixin, self).put(*args,**kwargs)
+        assert event.ok
+        return event
+
+class SingleGetterMixin(object):
+    def get(self, *args, **kwargs):
+        event = super(SingleGetterMixin, self).get(*args,**kwargs)
+        assert len(self._get_waiters) <= 1
+        return event
+
+class NoneBlockingGetMixin(object):
+    def get(self, *args, **kwargs):
+        event = super(NoneBlockingGetMixin, self).get(*args,**kwargs)
+        assert event.ok
+        return event
+
+class DummyPutPool(SingleGetterMixin, NoneBlockingPutMixin,Pool):
+    pass
+
+class DummyPool(NoneBlockingGetMixin,NoneBlockingPutMixin,Pool):
+    pass
+
+class DummyPutQueue(SingleGetterMixin,NoneBlockingPutMixin, Queue):
+    pass
+
+class DummyFilterQueue(NoneBlockingPutMixin, NoneBlockingGetMixin, FilterQueue):
+    pass
+
 
 class Top(Component):
     """The top-level component of the model."""
@@ -108,12 +140,15 @@ class Top(Component):
 class InsufficientDpException(Exception):
     pass
 
-
+class ResourceAllocFail(Exception):
+    pass
+class RejectResourcePermissionError(Exception):
+    pass
 class TaskPreemptedError(Exception):
     pass
 
 
-class RejectAllocException(Exception):
+class RejectDPAllocException(Exception):
     pass
 
 
@@ -128,53 +163,62 @@ class ResourceMaster(Component):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.unused_dp = Pool(self.env)
+
+        self.dp_policy = self.env.config["resource_master.dp_policy"]
+        self.is_dp_policy_fcfs = self.dp_policy == DP_POLICY_FCFS
+        self.is_dp_policy_dpf = self.dp_policy == DP_POLICY_DPF
+        self.is_dp_policy_rate = self.dp_policy == DP_POLICY_RATE_LIMIT
+        
+        self.unused_dp = DummyPool(self.env)
+
         self.auto_probe('unused_dp', vcd={'var_type': 'real'})
         self.init_blocks_ready = self.env.event()
-        self.committed_dp = Pool(self.env)
+        self.committed_dp = DummyPool(self.env)
 
         self.auto_probe('committed_dp', vcd={'var_type': 'real'})
 
-        self.block_dp_storage = Queue(self.env, capacity=float("inf"))
+        self.block_dp_storage = DummyPutQueue(self.env, capacity=float("inf"))
+
         # self.block_waiting_containers = [] # [[],[],...,[] ], put each task's waiting DP container in sublist
         self.is_cpu_needed_only = self.env.config['resource_master.is_cpu_needed_only']
-        self.cpu_pool = Pool(self.env, capacity=self.env.config["resource_master.cpu_capacity"],
+        self.cpu_pool = DummyPool(self.env, capacity=self.env.config["resource_master.cpu_capacity"],
                              init=self.env.config["resource_master.cpu_capacity"], hard_cap=True)
         self.auto_probe('cpu_pool', vcd={})
 
-        self.memory_pool = Pool(self.env, capacity=self.env.config["resource_master.memory_capacity"],
+        self.memory_pool = DummyPool(self.env, capacity=self.env.config["resource_master.memory_capacity"],
                                 init=self.env.config["resource_master.memory_capacity"], hard_cap=True)
         self.auto_probe('memory_pool', vcd={})
 
-        self.gpu_pool = Pool(self.env, capacity=self.env.config["resource_master.gpu_capacity"],
+        self.gpu_pool = DummyPool(self.env, capacity=self.env.config["resource_master.gpu_capacity"],
                              init=self.env.config["resource_master.gpu_capacity"], hard_cap=True)
         self.auto_probe('gpu_pool', vcd={})
 
-        self.mail_box = Queue(self.env)
+        self.mail_box = DummyPutQueue(self.env)
+
         self.task_state = dict()  # {task_id:{...},...,}
         self.add_processes(self.generate_datablocks_loop)
         self.add_processes(self.allocator_init_loop)
-        self.period = 1
-        self.policy = self.env.config["resource_master.dp_policy"]
-        self.debug("dp allocation policy %s" % self.policy)
-        # get by task id
-        self.dp_waiting_tasks = FilterQueue(self.env,
+        self.clock_period = 1
+        self.debug("dp allocation policy %s" % self.dp_policy)
+        # waiting for dp permission
+        self.dp_waiting_tasks = DummyFilterQueue(self.env,
                                             capacity=float("inf"))  # {tid: DRS },  put task id and state to cal order
-        self.resource_waiting_tasks = FilterQueue(self.env, capacity=float("inf"))
+
+        # waiting for resource permission
+        self.resource_waiting_tasks = DummyFilterQueue(self.env, capacity=float("inf"))
+
         self.auto_probe('resource_waiting_tasks', vcd={})
         self.auto_probe('dp_waiting_tasks', vcd={})
 
-        self.is_policy_fcfs = self.policy == POLICY_FCFS
-        self.is_policy_dpf = self.policy == POLICY_DPF
-        self.is_policy_rate = self.policy == POLICY_RATE_LIMIT
-        if self.is_policy_dpf:
+
+        if self.is_dp_policy_dpf:
             self.add_processes(self.scheduling_dp_loop)
             self.denom = self.env.config['resource_master.dp_policy.dpf.denominator']
 
         self.add_processes(self.scheduling_resources_loop)
 
     def clock_tick(self):
-        return self.env.timeout(self.period)
+        return self.env.timeout(self.clock_period)
 
     def scheduling_resources_loop(self):
         # permitted is a task state after its resources are permitted, before its resources are released
@@ -186,8 +230,8 @@ class ResourceMaster(Component):
         resrc_request_arrival_event = self.env.event()
         self.resource_waiting_tasks._put_hook = lambda: resrc_request_arrival_event.succeed()
 
-        def _grant_resource_permission(request_tid):
-            # non blocking 
+        def _permit_and_allocate_resource(request_tid,idle_resources):
+            # non blocking
             # todo more tear down operation
             resource_permitted_tasks.add(request_tid)
             # if permitted task is dp waiting, remove from dp waiting list
@@ -195,10 +239,12 @@ class ResourceMaster(Component):
             # assert self.task_state[request_tid]['resource_released_event'] not in resource_released_events
             # resource_released_events[self.task_state[request_tid]['resource_released_event']] = request_tid
             self.task_state[request_tid]['resource_permitted_event'].succeed()
-            # yield from _should_return_immediately(self.env, self.task_state[request_tid]['resource_allocated_event'])
-            # yield from _should_return_immediately(self.env, self.resource_waiting_tasks.get(filter=lambda x: x == request_tid))
             self.resource_waiting_tasks.get(filter=lambda x: x == request_tid)
 
+            idle_resources['cpu_level'] -= self.task_state[request_tid]['resource_request']['cpu']
+            if not self.is_cpu_needed_only:
+                idle_resources['gpu_level'] -= self.task_state[request_tid]['resource_request']['gpu']
+                idle_resources['memory_level'] -= self.task_state[request_tid]['resource_request']['memory']
 
 
         while True:
@@ -211,18 +257,14 @@ class ResourceMaster(Component):
             # only care about sleeping tasks' dp state change
             # warning:
             # sometimes, a task already dequeued from dp_waiting_tasks, but not comitted yet, assume those tasks are dp-waiting
-            # cannot wait for/catch all dp_committed_event.
+            # cannot wait for/catch all dp_committed_event in wait queue, need to iterate over to check eventually
 
             to_commit_dp_events = {self.task_state[tid]['dp_committed_event']: tid for tid in
-                                   self.resource_waiting_tasks.items if
-                                   not self.task_state[tid]['dp_committed_event'].triggered}
+                                   self.resource_waiting_tasks.items if not self.task_state[tid]['dp_committed_event'].triggered}
 
 
             # todo alternative is filter by dp_waiting_tasks
             sleeping_dp_waiting_tasks_init = set( (tid for evt,tid in to_commit_dp_events.items()) )
-            ## fixme !!! condition is violated for long simulation of rate limiting.
-
-
             # dp_waiting_tasks22 = {d['task_id'] for d in self.dp_waiting_tasks.items}
             # to_commit_dp_events22 = {self.task_state[tid]['dp_committed_event']: tid for tid in
             #                        self.resource_waiting_tasks.items if
@@ -247,6 +289,13 @@ class ResourceMaster(Component):
 
             try:
                 succeed_events = yield sched_listener
+                # warning: all true condition when wake up > actual triggered event
+                # need to check more after wake up
+
+                this_epoch_idle_resources = {"cpu_level": self.cpu_pool.level,
+                                             "gpu_level": self.gpu_pool.level,
+                                             "memory_level": self.memory_pool.level
+                }
                 succeed_dp_committed_events = []
                 succeed_arrival_events = []
                 succeed_resource_released_events = []
@@ -263,7 +312,7 @@ class ResourceMaster(Component):
                 assert len(succeed_arrival_events) <= 1
 
                 # overview of events-handling order:
-                # step1: if any, update dp_waiting/dp_granted state of waiting tasks
+                # step1: if any, update dp_waiting/dp_granted state of waiting tasks, may interrrupt tasks here
                 # step2: if there is a new task arrival and no resource was released, try to schedule new task.
                 # step3: after step1 and step2, scheduler's state is updated and ready. if resource was released, \
                 #        then make scheduling decision here.
@@ -291,16 +340,16 @@ class ResourceMaster(Component):
                     should_try_sched = True if len(succeed_resource_released_events)==0 else False
                     if self.task_state[request_tid]['dp_committed_event'].triggered:
                         if not self.task_state[request_tid]['dp_committed_event'].ok:
-                            # dp rejected, dequeue and do nothing
-                            yield from _should_return_immediately(self.env, self.resource_waiting_tasks.get(filter=lambda x: x == request_tid))
+                            # admission control: dp rejected, dequeue and do nothing
+                            self.resource_waiting_tasks.get(filter=lambda x: x == request_tid)
                             self.debug(request_tid, 'dp request is rejected upon resource request arrival, resource sched ignore the task')
                         # dp already granted
-                        elif should_try_sched and self._is_idle_resource_enough(request_tid):
-                            _grant_resource_permission(request_tid)
+                        elif should_try_sched and self._is_idle_resource_enough(request_tid,this_epoch_idle_resources):
+                            _permit_and_allocate_resource(request_tid, this_epoch_idle_resources)
 
                     # dp waiting
-                    elif should_try_sched and self._is_idle_resource_enough(request_tid):
-                        _grant_resource_permission(request_tid)
+                    elif should_try_sched and self._is_idle_resource_enough(request_tid,this_epoch_idle_resources):
+                        _permit_and_allocate_resource(request_tid, this_epoch_idle_resources)
                         # else:
                         #     pass
                             # dp_waiting_tasks.add(request_tid)
@@ -314,45 +363,49 @@ class ResourceMaster(Component):
 
                 # primary scheduling decision, when resource is released
                 if len(succeed_resource_released_events) != 0:
-                    sleeping_dp_waiting_tasks = set()
+                    fcfs_sleeping_dp_waiting_tasks = []
                     for sleeping_tid in copy.deepcopy(self.resource_waiting_tasks.items):
-
                         if not self.task_state[sleeping_tid]['dp_committed_event'].triggered:
                             # will schedule dp_waiting task later
-                            sleeping_dp_waiting_tasks.add(sleeping_tid)
+                            fcfs_sleeping_dp_waiting_tasks.append(sleeping_tid)
 
                         # sched dp granted tasks
                         elif self.task_state[sleeping_tid]['dp_committed_event'].ok:
-
-                            if self._is_idle_resource_enough(sleeping_tid):
-                                _grant_resource_permission(sleeping_tid)
+                            if self._is_idle_resource_enough(sleeping_tid,this_epoch_idle_resources):
+                                _permit_and_allocate_resource(sleeping_tid, this_epoch_idle_resources)
 
                         else:
-                            # fixme if dp commit event may fail when yield
-                            raise Exception("should already be dequeued in caught exception.")
+                            # dp commit event may fail  after triggered before proceed.
+                            self.resource_waiting_tasks.get(filter=lambda x: x == sleeping_tid)
+                            self.debug(sleeping_tid, "dp request is rejected, after listener triggered before proceeded %s" % self.task_state[sleeping_tid]['dp_committed_event'].value )
 
-                    assert len(sleeping_dp_waiting_tasks_init - sleeping_dp_waiting_tasks) >= 0
+                    assert len(sleeping_dp_waiting_tasks_init - set(fcfs_sleeping_dp_waiting_tasks)) >= 0
                     resource_waiting_tid_set = set(self.resource_waiting_tasks.items)
 
                     # sched dp waiting tasks
-                    for t in sorted(self.dp_waiting_tasks.items, reverse=False, key=lambda x: x['dominant_resource_share']):
-                        dp_waiting_tid = t['task_id']
-                        if dp_waiting_tid in resource_waiting_tid_set and self._is_idle_resource_enough(sleeping_tid):
-                            _grant_resource_permission(dp_waiting_tid)
+                    if self.is_dp_policy_dpf:
+                        sleeping_dp_waiting_sched_order =[t for t in sorted(self.dp_waiting_tasks.items, reverse=False, key=lambda tid: self.task_state[tid]['dominant_resource_share'])]
+                    elif self.is_dp_policy_fcfs or self.is_dp_policy_rate:
+                        sleeping_dp_waiting_sched_order = fcfs_sleeping_dp_waiting_tasks
 
-            except (InsufficientDpException, RejectAllocException) as err:
+                    for sleeping_tid in sleeping_dp_waiting_sched_order:
+                        # dp_waiting_tid = t['task_id']
+                        if sleeping_tid in resource_waiting_tid_set and self._is_idle_resource_enough(sleeping_tid,this_epoch_idle_resources):
+                            _permit_and_allocate_resource(sleeping_tid, this_epoch_idle_resources)
+
+            except (InsufficientDpException, RejectDPAllocException) as err:
                 dp_rejected_tid = err.args[0]
                 # dp_waiting_tasks.remove(dp_rejected_tid)
-                yield from _should_return_immediately(self.env, self.resource_waiting_tasks.get(filter=lambda x: x == dp_rejected_tid))
+                self.resource_waiting_tasks.get(filter=lambda x: x == dp_rejected_tid)
                 self.debug(dp_rejected_tid, "dp request is rejected, get dequeued from waiting resource requests")
 
-    def _is_idle_resource_enough(self, tid):
-        if self.cpu_pool.level < self.task_state[tid]['resource_request']['cpu']:
+    def _is_idle_resource_enough(self, tid, idle_resources):
+        if idle_resources['cpu_level'] < self.task_state[tid]['resource_request']['cpu']:
             return False
         if not self.is_cpu_needed_only:
-            if self.gpu_pool.level < self.task_state[tid]['resource_request']['gpu']:
+            if idle_resources['gpu_level'] < self.task_state[tid]['resource_request']['gpu']:
                 return False
-            if self.memory_pool.level < self.task_state[tid]['resource_request'][
+            if idle_resources['memory_level']< self.task_state[tid]['resource_request'][
                 'memory']:
                 return False
 
@@ -366,18 +419,18 @@ class ResourceMaster(Component):
             dp_request_arrival_event = self.env.event()
             self.dp_waiting_tasks._put_hook = lambda: dp_request_arrival_event.succeed()
             yield dp_request_arrival_event
-
+            this_epoch_unused_quota = [block['dp_quota'].level for block in self.block_dp_storage.items]
             # new task arrived
-            new_task_dict = self.dp_waiting_tasks.items[-1]
-            assert new_task_dict['dominant_resource_share'] is None
-            new_task_id = new_task_dict['task_id']
+            new_task_id = self.dp_waiting_tasks.items[-1]
+            assert self.task_state[new_task_id]['dominant_resource_share'] is None
+
 
             incremented_quota_idx = set(self.task_state[new_task_id]["resource_request"]['block_idx']) - set(
                 self.task_state[new_task_id]['retired_blocks'])
 
             # should update DRS of last new task if it demands any non-retired block
-            for t in self.dp_waiting_tasks.items:
-                t_id = t['task_id']
+            for t_id in self.dp_waiting_tasks.items:
+                # t_id = t['task_id']
                 # update DRS
                 if set(self.task_state[t_id]["resource_request"]['block_idx']) & incremented_quota_idx:
                     resource_shares = []
@@ -386,36 +439,43 @@ class ResourceMaster(Component):
                                 self.env.config["resource_master.block.init_epsilon"] -
                                 self.block_dp_storage.items[i]['dp_container'].level)
                         resource_shares.append(rs)
-                t['dominant_resource_share'] = max(resource_shares)
+                self.task_state[t_id]['dominant_resource_share'] = max(resource_shares)
 
             # iterate over tasks ordered by DRS, match quota, allocate.
             interrupted_task_ids = []
             # ordered_DRS = copy.deepcopy(sorted(self.dp_waiting_tasks.items, reverse=False, key=lambda x: x['dominant_resource_share']))
-            for t in sorted(self.dp_waiting_tasks.items, reverse=False, key=lambda x: x['dominant_resource_share']):
-                assert t['dominant_resource_share'] is not None
-                t_id = t['task_id']
-                this_task = self.task_state[t['task_id']]
+            for t_id in sorted(self.dp_waiting_tasks.items, reverse=False, key=lambda t_id: self.task_state[t_id]['dominant_resource_share']):
+                drs = self.task_state[t_id]['dominant_resource_share']
+                assert drs is not None
+                # t_id = t['task_id']
+                this_task = self.task_state[t_id]
                 # self.debug(t_id, "DRS: %.3f" % t['dominant_resource_share'])
-                for b_idx in range(len(self.block_dp_storage.items)):
-                    if self.block_dp_storage.items[b_idx]['dp_quota'].level < self.task_state[t_id]["resource_request"][
-                        'epsilon']:
+                sufficient_block_idx =[]
+                for b_idx,item in enumerate(self.block_dp_storage.items):
+                    block_unused_quota = this_epoch_unused_quota[b_idx]
+                    task_demand_epsilon = self.task_state[t_id]["resource_request"]['epsilon']
+                    if block_unused_quota < task_demand_epsilon:
                         self.debug(t_id, "current quota is insufficient ")
-                        if self.block_dp_storage.items[b_idx]['is_retired'] :
+                        if item['is_retired'] :
                             assert not this_task["handler_proc_dp"].triggered
                             this_task["handler_proc_dp"].interrupt(
-                                "dp allocation is rejected, because retired block %d has %.3f DP left < demanded epsilon %.3f" % (b_idx,self.block_dp_storage.items[b_idx]['dp_quota'].level, self.task_state[t_id]["resource_request"][
-                            'epsilon']))
-                            interrupted_task_ids.append(t['task_id'])
+                                "dp allocation is rejected, because retired block %d has %.3f DP left < demanded epsilon %.3f" % (b_idx,block_unused_quota, task_demand_epsilon))
+                            interrupted_task_ids.append(t_id)
 
                         break
-
+                    else:
+                        sufficient_block_idx.append(b_idx)
+                # task can be granted
                 else:
-                    self.debug(t_id, "DP granted, DRS: %.3f" % t['dominant_resource_share'])
-                    yield self.dp_waiting_tasks.get(filter=lambda item: item['task_id'] == t['task_id'])
-                    this_task["grant_dp_permitted_event"].succeed()
+                    self.debug(t_id, "DP permitted, DRS: %.3f" % drs)
+                    self.dp_waiting_tasks.get(filter=lambda tid_item: tid_item ==t_id)
+
+                    for i in sufficient_block_idx:
+                        this_epoch_unused_quota[i] -= self.task_state[t_id]["resource_request"]['epsilon']
+                    this_task["dp_permitted_event"].succeed()
                     # break
             for tid in interrupted_task_ids:
-                yield self.dp_waiting_tasks.get(filter=lambda item: item['task_id'] == tid)
+                self.dp_waiting_tasks.get(filter=lambda tid_item: tid_item == tid)
 
     def allocator_init_loop(self):
         while True:
@@ -425,6 +485,8 @@ class ResourceMaster(Component):
                 assert msg["task_id"] not in self.task_state
                 self.task_state[msg["task_id"]] = dict()
                 self.task_state[msg["task_id"]]["task_proc"] = msg["task_process"]
+                self.task_state[msg["task_id"]]["task_core_proc"] = None
+
 
             elif msg["message_type"] == ALLOCATION_REQUEST:
                 assert msg["task_id"] in self.task_state
@@ -441,11 +503,12 @@ class ResourceMaster(Component):
 
                 self.task_state[msg["task_id"]]["task_completion_event"] = msg.pop("task_completion_event")
                 # following two events are controlled by scheduling policy
-                self.task_state[msg["task_id"]]["grant_dp_permitted_event"] = self.env.event()
+                self.task_state[msg["task_id"]]["dp_permitted_event"] = self.env.event()
                 self.task_state[msg["task_id"]]["resource_permitted_event"] = self.env.event()
                 self.task_state[msg["task_id"]]["resource_released_event"] = self.env.event()
 
-                self.task_state[msg["task_id"]]["retired_blocks"] = [] if self.is_policy_dpf else None
+                self.task_state[msg["task_id"]]["retired_blocks"] = [] if self.is_dp_policy_dpf else None
+                self.task_state[msg["task_id"]]["dominant_resource_share"] = None
 
                 self.task_state[msg["task_id"]]["execution_proc"] = msg.pop("execution_proc")
                 self.task_state[msg["task_id"]]["waiting_for_dp_proc"] = msg.pop("waiting_for_dp_proc")
@@ -459,8 +522,7 @@ class ResourceMaster(Component):
                 self.task_state[msg["task_id"]]["accum_containers"] = dict()  # blk_idx: container
 
                 msg['task_init_event'].succeed()
-            elif msg["message_type"] == TASK_RESOURCE_RELEASED:
-                assert msg["task_id"] in self.task_state
+
 
     def task_dp_handler(self, task_id):
         self.debug(task_id, "Task DP handler created")
@@ -481,66 +543,63 @@ class ResourceMaster(Component):
         # getevent -> blk_idx
         get_evt_block_mapping = OrderedDict()
 
-        if self.is_policy_fcfs:
+        if self.is_dp_policy_fcfs:
             for i in resource_demand["block_idx"]:
-                get_evt_block_mapping[
-                    self.block_dp_storage.items[i]["dp_container"].get(resource_demand["epsilon"])] = i
-            try:
-                yield self.env.all_of(get_evt_block_mapping)
-            except Exception as err:
-                self.debug(task_id, "fcfs policy error, should return immediately")
-                raise err
+                self.block_dp_storage.items[i]["dp_container"].get(resource_demand["epsilon"])
+
+            # try:
+            #     yield self.env.all_of(get_evt_block_mapping)
+            # except Exception as err:
+            #     self.debug(task_id, "fcfs policy error, should return immediately")
+            #     raise err
 
 
         # appliable to other policies controlled by another (centralized) processes
-        elif self.is_policy_dpf:
-            t0 = self.env.now
+        elif self.is_dp_policy_dpf:
+
+            # quota increment
             for i in resource_demand["block_idx"]:
                 self.block_dp_storage.items[i]["arrived_task_num"] += 1
                 if not self.block_dp_storage.items[i]["is_retired"]:
                     quota_increment = self.env.config["resource_master.block.init_epsilon"] / self.denom
-                    yield from _should_return_immediately(self.env, self.block_dp_storage.items[i][
-                        'dp_container'].get(quota_increment))
-
-                    yield self.block_dp_storage.items[i]['dp_quota'].put(quota_increment)
+                    self.block_dp_storage.items[i]['dp_container'].get(quota_increment)
+                    self.block_dp_storage.items[i]['dp_quota'].put(quota_increment)
                     if self.block_dp_storage.items[i]["arrived_task_num"] == self.denom:
                         self.block_dp_storage.items[i]["is_retired"] = True
                 else:
                     self.task_state[task_id]['retired_blocks'].append(i)
 
-            yield self.dp_waiting_tasks.put({'task_id': task_id,
-                                             'dominant_resource_share': None})
-
-            assert self.env.now - t0 < TIMEOUT_TOLERATE
+            self.dp_waiting_tasks.put( task_id)
 
 
             try:
                 t0 = self.env.now
                 self.debug(task_id, "wait for grant_dp_permitted" )
-                yield self.task_state[task_id]["grant_dp_permitted_event"]
+                yield self.task_state[task_id]["dp_permitted_event"]
                 self.debug(task_id, "grant_dp_permitted after %.1f sec" % (self.env.now - t0 ) )
                 for i in resource_demand["block_idx"]:
-                    get_evt_block_mapping[
-                        self.block_dp_storage.items[i]["dp_quota"].get(resource_demand["epsilon"])] = i
+                    # get_evt_block_mapping[
+                    self.block_dp_storage.items[i]["dp_quota"].get(resource_demand["epsilon"])
 
-                t0 = self.env.now
-                yield self.env.all_of(get_evt_block_mapping)
-                assert self.env.now - t0 < TIMEOUT_TOLERATE
+                # t0 = self.env.now
+                # yield self.env.all_of(get_evt_block_mapping)
+                # assert self.env.now - t0 < TIMEOUT_TOLERATE
 
             except simpy.Interrupt as err:
-                self.debug(task_id, "policy=%s, fail to acquire dp due to [%s]" % (self.policy, err))
+                self.debug(task_id, "policy=%s, fail to acquire dp due to [%s]" % (self.dp_policy, err))
                 # should not issue get to quota
-                assert not self.task_state[task_id]["grant_dp_permitted_event"].triggered
+                assert not self.task_state[task_id]["dp_permitted_event"].triggered
                 assert len(get_evt_block_mapping) == 0
                 # interrupt dp_waiting_proc
-                dp_committed_event.fail(RejectAllocException(task_id,"request DP interrupted"))
+                dp_committed_event.fail(RejectDPAllocException(task_id, "request DP interrupted"))
                 return
 
         # attach containers to demanded blocks , handling rejection, return dp etc.
-        elif self.policy == POLICY_RATE_LIMIT:
+        elif self.is_dp_policy_rate:
 
             for i in resource_demand["block_idx"]:
-                cn = Pool(self.env, capacity=float('inf'), init=0.0)
+                # need to wait get on own accum containers
+                cn = DummyPutPool(self.env, capacity=float('inf'), init=0.0)
                 this_task["accum_containers"][i] = cn
                 self.block_dp_storage.items[i]["accum_containers"][task_id] = cn
 
@@ -551,20 +610,22 @@ class ResourceMaster(Component):
                 while (len(unget_blk_ids) != 0):
                     listened_gets = (get for get, blk in get_evt_block_mapping.items() if blk in unget_blk_ids)
                     succeed_gets = yield self.env.any_of(listened_gets)
-                    for g in succeed_gets:
+                    # warning: more gets may get triggered than g, can handle later
+                    for g in succeed_gets.events:
                         blk_idx = get_evt_block_mapping[g]
                         # stop wait once accum enough
                         accum_container = self.block_dp_storage.items[blk_idx]["accum_containers"].pop(task_id)
                         left_accum = accum_container.level
                         # return extra dp back
-                        yield accum_container.get(left_accum)
+                        get_extra_dp = accum_container.get(left_accum)
+                        assert get_extra_dp.ok
                         self.block_dp_storage.items[blk_idx]["dp_container"].put(left_accum)
                         unget_blk_ids.remove(blk_idx)
 
             except simpy.Interrupt as err:
                 self.debug(task_id, "request DP interrupted")
                 # interrupt dp_waiting_proc
-                dp_committed_event.fail(RejectAllocException(task_id,"request DP interrupted"))
+                dp_committed_event.fail(RejectDPAllocException(task_id, "request DP interrupted"))
 
                 for blk_idx in resource_demand["block_idx"]:
                     # pop, stop task's all waiting container
@@ -576,43 +637,51 @@ class ResourceMaster(Component):
 
                     accum_container = this_task['accum_containers'][blk_idx]
                     dp_container = self.block_dp_storage.items[blk_idx]["dp_container"]
-                    # return dp back to block
-                    left_accum = accum_container.level
-                    if left_accum:
-                        yield accum_container.get(left_accum)
-                        # if not self.block_dp_storage.items[blk_idx]["is_dead"]:
-                        if dp_container.level + left_accum <= dp_container.capacity:
-
-                            yield dp_container.put(left_accum)
-                        else:
-
-                            assert dp_container.level + left_accum < dp_container.capacity + NUMERICAL_DELTA
-                            yield dp_container.put(dp_container.capacity - dp_container.level)
-
+                    # return left dp back to block
+                    left_accum_abt = accum_container.level
+                    # return already get amount
                     if get_event.triggered:
                         assert get_event.ok
-                        if dp_container.level + get_event.amount <= dp_container.capacity:
-                            return_dp_event = dp_container.put(get_event.amount)
-                            yield return_dp_event
+                        if dp_container.level + get_event.amount < dp_container.capacity:
+                            dp_container.put(get_event.amount)
                         else:
+                            # fill to full
                             # tolerate small numerical inaccuracy
+                            # fixme something went wrong!! LHS too big!! (5.37780222085285, 5.01)
                             assert dp_container.level + get_event.amount < dp_container.capacity + NUMERICAL_DELTA
-                            yield dp_container.put(dp_container.capacity - dp_container.level)
+                            dp_container.put(dp_container.capacity - dp_container.level)
 
                     else:
+                        # to ensure at most one get waiter, cancel before issue new get
+                        # cancelled event is processed but not triggered
                         get_event.cancel()
 
-                self.debug(task_id, "policy=%s, fail to acquire dp due to [%s]" % (self.policy, err))
+                    if left_accum_abt:
+                        assert (not get_event.triggered) != (not get_event.processed)
+                        g = accum_container.get(left_accum_abt)
+                        assert g.ok
+                        # if not self.block_dp_storage.items[blk_idx]["is_dead"]:
+                        if dp_container.level + left_accum_abt < dp_container.capacity:
+                            dp_container.put(left_accum_abt)
+
+                        else:
+                            # fill to full
+                            # tolerate small numerical inaccuracy
+                            assert dp_container.level + left_accum_abt < dp_container.capacity + NUMERICAL_DELTA
+                            dp_container.put(dp_container.capacity - dp_container.level)
+
+
+                self.debug(task_id, "policy=%s, fail to acquire dp due to [%s]" % (self.dp_policy, err))
                 return
 
-        yield from self._commit_dp_allocation(resource_demand["block_idx"], epsilon=resource_demand["epsilon"])
+        self._commit_dp_allocation(resource_demand["block_idx"], epsilon=resource_demand["epsilon"])
         self.task_state[task_id]["is_dp_granted"] = True
         assert not dp_committed_event.triggered
         dp_committed_event.succeed()
 
     def task_resources_handler(self, task_id):
         self.debug(task_id, "Task resource handler created")
-        # add to wait queue
+        # add to resources wait queue
         self.resource_waiting_tasks.put(task_id)
         this_task = self.task_state[task_id]
         resource_allocated_event = this_task["resource_allocated_event"]
@@ -621,58 +690,62 @@ class ResourceMaster(Component):
 
         resource_permitted_event = this_task["resource_permitted_event"]
 
-        get_resrc_events = {}
+        success_resrc_get_events = []
+
         try:
 
             yield resource_permitted_event
             get_cpu_event = self.cpu_pool.get(resource_demand["cpu"])
-            get_resrc_events[get_cpu_event] = 'cpu'
+            success_resrc_get_events.append(get_cpu_event)
 
             if not self.is_cpu_needed_only:
                 get_memory_event = self.memory_pool.get(resource_demand["memory"])
-                get_resrc_events[get_memory_event] = 'memory'
+                success_resrc_get_events.append(get_memory_event)
 
                 get_gpu_event = self.gpu_pool.get(resource_demand["gpu"])
-                get_resrc_events[get_gpu_event] = 'gpu'
+                success_resrc_get_events.append(get_gpu_event)
 
-            yield self.env.all_of(get_resrc_events)
+            # yield self.env.all_of(get_resrc_events)
 
             resource_allocated_event.succeed()
             self.task_state[task_id]["resource_allocate_timestamp"] = self.env.now
-        except simpy.Interrupt as err:
-            self.debug(task_id, 'get interrupted when waiting for resources, deallocate')
-            put_resrc_event = []
-            resource_pools = {'cpu': self.cpu_pool, 'memory':self.memory_pool, 'gpu': self.gpu_pool}
-            for get_evt,resource_name in get_resrc_events.items():
-                if get_evt.triggered:
-                    assert get_evt.ok
-                    put_event = resource_pools[resource_name].put(resource_demand[resource_name])
-                    put_resrc_event.append(put_event)
-                else:
-                    get_evt.cancel()
-            if len(put_resrc_event):
-                yield self.env.all_of(put_resrc_event)
-            return
+        except (simpy.Interrupt,RejectResourcePermissionError) as err:
+            # fixme coverage
+            resource_allocated_event.fail(ResourceAllocFail("fail to alloc resource"))
+            assert len(success_resrc_get_events) == 0
+            if resource_permitted_event.triggered:
+                # interrupted while runnable
+                assert resource_permitted_event.ok and (not resource_permitted_event.processed)
 
+            else:
+                assert not resource_permitted_event.triggered
+                # interrupted while waiting for permission
+                pass
+            execution_proc = this_task['execution_proc']
+            # execution_proc.interrupt('Stop! resource handler fail to acquire DP')
+
+
+            return
 
         try:
             yield task_completion_event
         except TaskPreemptedError as err:
             self.debug(task_id, 'task fails while running due to [%s], going to release resource' % err)
 
-        put_resrc_events = []
+        # put_resrc_events = []
         put_cpu_event = self.cpu_pool.put(resource_demand["cpu"])
-        put_resrc_events.append(put_cpu_event)
+        # put_resrc_events.append(put_cpu_event)
         if not self.is_cpu_needed_only:
             put_gpu_event = self.gpu_pool.put(resource_demand["gpu"])
-            put_resrc_events.append(put_gpu_event)
+            # put_resrc_events.append(put_gpu_event)
 
             put_memory_event = self.memory_pool.put(resource_demand["memory"])
-            put_resrc_events.append(put_memory_event)
+            # put_resrc_events.append(put_memory_event)
 
-        yield self.env.all_of(put_resrc_events)
+        # yield self.env.all_of(put_resrc_events)
         self.debug(task_id, "Resource released")
         this_task['resource_released_event'].succeed()
+        return
 
     ## for rate limit policy
     def dp_rate_release_loop(self, block_id):
@@ -699,7 +772,7 @@ class ResourceMaster(Component):
                 this_task = self.task_state[task_id]
 
                 # compare capacity, conservative reject
-                # fixme: following not executed??
+                # fixme coverage
                 if this_task["resource_request"]["epsilon"] > this_block["dp_container"].capacity:
                     this_block["accum_containers"].pop(task_id)
                     this_task["handler_proc_dp"].interrupt(
@@ -713,15 +786,18 @@ class ResourceMaster(Component):
                     # some dp may left due to task's return operation
                     rate = this_block["dp_container"].level / rest_of_life
                     is_active = True
-                try:
-                    yield from _should_return_immediately(self.env, this_block["dp_container"].get(rate))
+                # try:
+                get_amount = min(rate, this_block["dp_container"].level)
+                assert (this_block["dp_container"].level / rate) > (1-NUMERICAL_DELTA)
+                this_block["dp_container"].get(get_amount)
 
-                except Exception as err:
-                    self.debug(block_id, "rate %d waiter_nr %d" % (rate, waiting_task_nr))
-                    raise err
+                # except Exception as err:
+                #     self.debug(block_id, "rate %d waiter_nr %d" % (rate, waiting_task_nr))
+                #     raise err
 
                 for task_id, cn in this_block["accum_containers"].items():
-                    cn.put(rate / waiting_task_nr)
+                    dp_release_event = cn.put(get_amount / waiting_task_nr)
+                    assert dp_release_event.ok
             else:
                 is_active = False
 
@@ -744,10 +820,10 @@ class ResourceMaster(Component):
             # yield block_id
             cur_block_id = next(block_id)
             total_dp = self.env.config['resource_master.block.init_epsilon']
-            new_block = Pool(self.env, capacity=total_dp, init=total_dp, name=cur_block_id, hard_cap=True)
+            new_block = DummyPool(self.env, capacity=total_dp, init=total_dp, name=cur_block_id, hard_cap=True)
 
-            if self.policy == POLICY_DPF:
-                new_quota = Pool(self.env, capacity=total_dp, init=0, name=cur_block_id, hard_cap=True)
+            if self.is_dp_policy_dpf:
+                new_quota = DummyPool(self.env, capacity=total_dp, init=0, name=cur_block_id, hard_cap=True)
                 is_retired = False
                 arrived_task_num = 0
 
@@ -756,13 +832,13 @@ class ResourceMaster(Component):
                 is_retired = None
                 arrived_task_num = None
 
-            if self.policy == POLICY_RATE_LIMIT:
+            if self.is_dp_policy_rate:
                 EOL = self.env.now + self.env.config['resource_master.dp_policy.rate_policy.lifetime'] - 1
-                accum_cn = dict()
+                accum_cn_dict = dict()
                 is_dead = False
             else:
                 EOL = None
-                accum_cn = None
+                accum_cn_dict = None
                 is_dead = None
 
             block_item = {
@@ -770,17 +846,17 @@ class ResourceMaster(Component):
                 "dp_quota": new_quota,
                 # lifetime :=  # of periods from born to end
                 "end_of_life": EOL,
-                "accum_containers": accum_cn,  # task_id: container
+                "accum_containers": accum_cn_dict,  # task_id: container
                 'is_dead': is_dead,
                 'is_retired': is_retired,
                 'arrived_task_num': arrived_task_num,
             }
 
-            yield self.block_dp_storage.put(block_item)
-            yield self.unused_dp.put(total_dp)
+            self.block_dp_storage.put(block_item)
+            self.unused_dp.put(total_dp)
             self.debug(block_id, "new data block created")
 
-            if self.policy == POLICY_RATE_LIMIT:
+            if self.is_dp_policy_rate:
                 self.env.process(self.dp_rate_release_loop(cur_block_id))
 
     def _commit_dp_allocation(self, block_idx: List[int], epsilon: float):
@@ -804,7 +880,7 @@ class ResourceMaster(Component):
         for i in block_idx:
             this_container = self.block_dp_storage.items[i]["dp_container"]
             this_container.capacity = max(this_container.capacity - epsilon, this_container.level)
-        yield self.unused_dp.get(epsilon * len(block_idx))
+        self.unused_dp.get(epsilon * len(block_idx))
         self.committed_dp.put(epsilon * len(block_idx))
 
     def get_result_hook(self, result):
@@ -826,7 +902,7 @@ class ResourceMaster(Component):
                                       root_data['children'][0]['children'][2]['data'])
 
                 idle_cpu_record = list(idle_cpu_record)
-
+                # record should start at time 0
                 if idle_cpu_record[0][0] != 0:
                     idle_cpu_record = [(0, cpu_capacity)] + idle_cpu_record
 
@@ -851,31 +927,31 @@ class Tasks(Component):
         self.add_connections('resource_master')
         self.add_process(self.generate_tasks)
 
-        self.task_unpublished_count = Container(self.env)
+        self.task_unpublished_count = DummyPool(self.env)
         self.auto_probe('task_unpublished_count', vcd={})
 
-        self.task_published_count = Container(self.env)
+        self.task_published_count = DummyPool(self.env)
         self.auto_probe('task_published_count', vcd={})
 
-        self.task_sleeping_count = Container(self.env)
+        self.task_sleeping_count = DummyPool(self.env)
         self.auto_probe('task_sleeping_count', vcd={})
 
-        self.task_running_count = Container(self.env)
+        self.task_running_count = DummyPool(self.env)
         self.auto_probe('task_running_count', vcd={})
 
-        self.task_completed_count = Container(self.env)
+        self.task_completed_count = DummyPool(self.env)
         self.auto_probe('task_completed_count', vcd={})
 
-        self.task_preempted_count = Container(self.env)
-        self.auto_probe('task_preempted_count', vcd={})
+        self.task_abort_count = DummyPool(self.env)
+        self.auto_probe('task_abort_count', vcd={})
 
-        self.task_ungranted_count = Container(self.env)
+        self.task_ungranted_count = DummyPool(self.env)
         self.auto_probe('task_ungranted_count', vcd={})
 
-        self.task_granted_count = Container(self.env)
+        self.task_granted_count = DummyPool(self.env)
         self.auto_probe('task_granted_count', vcd={})
 
-        self.task_dp_rejected_count = Container(self.env)
+        self.task_dp_rejected_count = DummyPool(self.env)
         self.auto_probe('task_dp_rejected_count', vcd={})
 
         if self.env.tracemgr.sqlite_tracer.enabled:
@@ -966,9 +1042,9 @@ class Tasks(Component):
             self.resource_master.mail_box.put(new_task_msg)
 
     def task(self, task_id):
-        yield self.task_unpublished_count.put(1)
-        yield self.task_ungranted_count.put(1)
-        yield self.task_sleeping_count.put(1)
+        self.task_unpublished_count.put(1)
+        self.task_ungranted_count.put(1)
+        self.task_sleeping_count.put(1)
 
         epsilon = self.epsilon_dist()
 
@@ -988,20 +1064,23 @@ class Tasks(Component):
         def run_task(task_id, resource_allocated_event, completion_event):
 
             assert not resource_allocated_event.triggered
+            waked_from_allocation = None
             try:
 
                 yield resource_allocated_event
-
+                waked_from_allocation =True
                 resource_alloc_time = self.resource_master.task_state[task_id]["resource_allocate_timestamp"]
                 assert resource_alloc_time is not None
                 resrc_allocation_wait_duration = resource_alloc_time - t0
                 self.debug(task_id, 'Resources allocated after', timedelta(seconds=resrc_allocation_wait_duration))
 
-                yield self.task_sleeping_count.get(1)
-                yield self.task_running_count.put(1)
+                self.task_sleeping_count.get(1)
+                self.task_running_count.put(1)
 
                 # running task
-                yield self.env.timeout(resource_request_msg["completion_time"])
+                core_running_task = self.env.timeout(resource_request_msg["completion_time"])
+                self.resource_master.task_state[task_id]['task_core_proc'] = core_running_task
+                yield core_running_task
                 completion_event.succeed()
 
                 # yield self.resource_master.mail_box.put(task_completion_msg)
@@ -1009,8 +1088,8 @@ class Tasks(Component):
                     "task_completion_timestamp"] = self.env.now
                 task_completion_duration = task_completion_timestamp - t0
                 self.debug(task_id, 'Task completed after', timedelta(seconds=task_completion_duration))
-                yield self.task_running_count.get(1)
-                yield self.task_completed_count.put(1)
+                self.task_running_count.get(1)
+                self.task_completed_count.put(1)
                 return 0
             except simpy.Interrupt as err:
                 task_preempted_timestamp = self.resource_master.task_state[task_id][
@@ -1024,16 +1103,26 @@ class Tasks(Component):
                     self.debug(task_id, "Task gets preempted while waiting for resource alloc")
                     self.resource_master.task_state[task_id]["handler_proc_resource"].interrupt(
                         "Cancel resource allocation for me, get preempted")
-                    yield self.task_sleeping_count.get(1)
-                    yield self.task_preempted_count.put(1)
+                    self.task_sleeping_count.get(1)
+                    self.task_abort_count.put(1)
 
                 else:
                     assert resource_allocated_event.ok
-                    self.debug(task_id, "Task gets preempted while running")
-                    # interrupt handler_proc_resource
-                    completion_event.fail(TaskPreemptedError("Abort task, preempted while runninng"))
-                    yield self.task_running_count.get(1)
-                    yield self.task_preempted_count.put(1)
+                    # interrupt task_resources_handler
+                    completion_event.fail(TaskPreemptedError("Abort task, preempted after resource allocation"))
+                    if waked_from_allocation:
+                        assert not self.resource_master.task_state[task_id]['task_core_proc'].processed
+                        self.debug(task_id, "Task gets preempted while running")
+
+                        self.task_running_count.get(1)
+                        self.task_abort_count.put(1)
+                    # fixme coverage
+                    else:
+                        self.debug(task_id, "Task gets preempted while runnable")
+                        assert self.resource_master.task_state[task_id]['task_core_proc'] is None
+                        self.task_sleeping_count.get(1)
+                        self.task_abort_count.put(1)
+
 
                 return 1
 
@@ -1047,11 +1136,12 @@ class Tasks(Component):
                 dp_committed_duration = dp_committed_time - t0
                 self.debug(task_id, 'DP committed after', timedelta(seconds=dp_committed_duration))
 
-                yield self.task_ungranted_count.get(1)
-                yield self.task_granted_count.put(1)
+                self.task_ungranted_count.get(1)
+                self.task_granted_count.put(1)
                 return 0
-            except (InsufficientDpException, RejectAllocException) as err:
+            except (InsufficientDpException, RejectDPAllocException) as err:
                 assert not dp_committed_event.ok
+                # todo move to dp handler
                 if execution_proc.is_alive:
                     execution_proc.interrupt('Stop! task_dp_handler fail to acquire DP')
                 dp_rejected_timestamp = self.resource_master.task_state[task_id]["dp_commit_timestamp"] = -self.env.now
@@ -1087,7 +1177,7 @@ class Tasks(Component):
             'waiting_for_dp_proc': waiting_for_dp,
         }
         # send allocation request, note do it after listen!
-        yield self.resource_master.mail_box.put(resource_request_msg)
+        self.resource_master.mail_box.put(resource_request_msg)
 
         dp_grant, task_exec = yield self.env.all_of([waiting_for_dp, running_task])
 
@@ -1095,8 +1185,8 @@ class Tasks(Component):
             # verify, if dp granted, then task must be completed.
             assert task_exec.value == 0
             self.resource_master.task_state[task_id]["task_publish_timestamp"] = self.env.now
-            yield self.task_unpublished_count.get(1)
-            yield self.task_published_count.put(1)
+            self.task_unpublished_count.get(1)
+            self.task_published_count.put(1)
             self.debug(task_id, "task get published")
         else:
             assert dp_grant.value == 1
@@ -1118,7 +1208,7 @@ class Tasks(Component):
             assert isinstance(resource_request_msg["epsilon"], float)
             assert isinstance(resource_request_msg["cpu"], int)
             assert isinstance(resource_request_msg["gpu"], (int, NoneType))
-            assert isinstance(resource_request_msg["memory"], (float, int, NoneType))
+            assert isinstance(resource_request_msg["memory"], (int, NoneType))
             assert isinstance(t0, float)
             assert isinstance(self.resource_master.task_state[task_id]["dp_commit_timestamp"], (float, int))
             assert isinstance(self.resource_master.task_state[task_id]["resource_allocate_timestamp"],
@@ -1203,17 +1293,12 @@ select avg(a)from (
             ).fetchone()[0]
 
 
-def _should_return_immediately(env, event, timeout_tolerate=0.01):
-    aa = yield env.timeout(timeout_tolerate, value=TIMEOUT_VAL) | event
-    if aa == TIMEOUT_VAL:
-        raise ShouldTriggeredImmediatelyException("non-retired block cannot get")
-
 if __name__ == '__main__':
     import copy
 
-    run_test_single = True
+    run_test_single = False
     run_test_many = True
-    run_test_parallel = True
+    run_test_parallel = False
 
 
 
@@ -1223,7 +1308,7 @@ if __name__ == '__main__':
         'task.demand.num_blocks.mu': 20,
         'task.demand.num_blocks.sigma': 10,
         # num_blocks * 1/mean_tasks_per_block = 1/10
-        'task.demand.epsilon.mean_tasks_per_block': 200,
+        'task.demand.epsilon.mean_tasks_per_block': 15,
 
         'task.completion_time.constant': 1,
         # max = half of capacity
@@ -1246,7 +1331,7 @@ if __name__ == '__main__':
         # 'resource_master.dp_policy.rate_policy.lifetime': 300,
 
         # 'resource_master.dp_policy': FCFS_POLICY,
-        'resource_master.dp_policy': POLICY_DPF,
+        'resource_master.dp_policy': DP_POLICY_DPF,
         'resource_master.dp_policy.dpf.denominator': 20,
         # https://cloud.google.com/compute/docs/gpus
         # V100 VM instance
@@ -1259,7 +1344,7 @@ if __name__ == '__main__':
         'sim.db.persist': True,
         'sim.dot.colorscheme': 'blues5',
         'sim.dot.enable': True,
-        'sim.duration': '500000 s',
+        'sim.duration': '100000 s',
         # 'sim.duration': '50000 s',
         'sim.gtkw.file': 'sim.gtkw',
         'sim.gtkw.live': False,
@@ -1312,7 +1397,7 @@ if __name__ == '__main__':
     scheduler_configs = {}
     config1 = copy.deepcopy(config)
     # use rate limit by default
-    config1["resource_master.dp_policy"] = POLICY_RATE_LIMIT
+    config1["resource_master.dp_policy"] = DP_POLICY_RATE_LIMIT
     # use random
     config1['task.completion_time.constant'] = None
     config1['task.demand.num_cpu.constant'] = None
@@ -1337,14 +1422,14 @@ if __name__ == '__main__':
                                        # 5
                                        }
 
-    scheduler_configs["fcfs_policy"] = {'resource_master.dp_policy': POLICY_FCFS}
+    scheduler_configs["fcfs_policy"] = {'resource_master.dp_policy': DP_POLICY_FCFS}
 
-    scheduler_configs["rate_policy_slow_release"] = {'resource_master.dp_policy': POLICY_RATE_LIMIT,
+    scheduler_configs["rate_policy_slow_release"] = {'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
                                                      'resource_master.dp_policy.rate_policy.lifetime': config1[
                                                                                                            'task.arrival_interval'] * 10 * 5
                                                      # 500
                                                      }
-    scheduler_configs["rate_policy_fast_release"] = {'resource_master.dp_policy': POLICY_RATE_LIMIT,
+    scheduler_configs["rate_policy_fast_release"] = {'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
                                                      'resource_master.dp_policy.rate_policy.lifetime': config1[
                                                                                                            'task.arrival_interval'] * 5}  # 50
     dp_factor_names = set()
@@ -1361,34 +1446,35 @@ if __name__ == '__main__':
     configs = []
 
 
-#    config2 = copy.deepcopy(config1)
-#    config2["sim.workspace"] = "workspace_fcfs"
-#    config2["resource_master.dp_policy"] = POLICY_FCFS
-
-#    configs.append(config2)
-
-#    config2 = copy.deepcopy(config1)
-#    config2["sim.workspace"] = "workspace_dpf"
-#    config2["resource_master.dp_policy"] = POLICY_DPF
-
-#    configs.append(config2)
+    # config2 = copy.deepcopy(config1)
+    # config2["sim.workspace"] = "workspace_fcfs"
+    # config2["resource_master.dp_policy"] = DP_POLICY_FCFS
+    #
+    # configs.append(config2)
+    #
+    # config2 = copy.deepcopy(config1)
+    # config2["sim.workspace"] = "workspace_dpf"
+    # config2["resource_master.dp_policy"] = DP_POLICY_DPF
+    #
+    # configs.append(config2)
 
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_rate_limiting"
-    config2["resource_master.dp_policy"] = POLICY_RATE_LIMIT
+    config2["resource_master.dp_policy"] = DP_POLICY_RATE_LIMIT
     config2["resource_master.dp_policy.rate_policy.lifetime"] = 300
 
     configs.append(config2)
 
 
-    if run_test_parallel:
-        simulate_many(configs, Top)
 
 
     if run_test_many:
         for c in configs:
             pprint(c)
-            simulate(c, Top)
+            simulate(copy.deepcopy(c), Top)
+
+    if run_test_parallel:
+        simulate_many(copy.deepcopy(configs), Top)
 
     for sched_conf_k, sched_conf_v in scheduler_configs.items():
         for task_conf_k, task_conf_v in task_configs.items():
