@@ -307,12 +307,12 @@ class Queue(Generic[ItemType]):
             if self._get_hook:
                 self._get_hook()
 
-    def _trigger_when_at_least(self, _: Optional[Event] = None) -> None:
+    def _trigger_when_at_least(self, _: Optional[Event] = None, *args, **kwargs) -> None:
         while (
             self._at_least_waiters and self.size >= self._at_least_waiters[0].num_items
         ):
             when_at_least_ev = heappop(self._at_least_waiters)
-            when_at_least_ev.succeed()
+            when_at_least_ev.succeed(*args,**kwargs)
 
     def _trigger_when_at_most(self, _: Optional[Event] = None) -> None:
         while self._at_most_waiters and self.size <= self._at_most_waiters[0].num_items:
@@ -416,7 +416,7 @@ class FilterQueue(Queue[ItemType]):
     else:
         get = BoundClass(FilterQueueGet)
 
-    def _trigger_get(self, _: Optional[Event] = None) -> None:
+    def _trigger_get(self, _: Optional[Event] = None,*args,**kwargs) -> None:
 
         idx = 0
         while self._get_waiters and idx < len(self._get_waiters):
@@ -425,7 +425,7 @@ class FilterQueue(Queue[ItemType]):
                 if get_ev.filter(item):
                     self.items.pop(i)
                     self._get_waiters.pop(idx)
-                    get_ev.succeed(item)
+                    get_ev.succeed(item,*args,**kwargs)
                     if self._get_hook:
                         self._get_hook()
                     break
