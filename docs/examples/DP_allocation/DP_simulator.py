@@ -726,30 +726,14 @@ class ResourceMaster(Component):
         is_active = False
         rate = 0
         this_block = self.block_dp_storage.items[block_id]
-
-        while True:
-            yield self.clock_tick()
-            rest_life_periods = this_block["end_of_life"] - self.env.now + 1
+        # rest_life_periods
+        rest_life_periods = this_block["end_of_life"] - self.env.now + 1
+        while rest_life_periods > 0:
 
             waiting_task_cn_mapping = {tid: cn for tid, cn in this_block["accum_containers"].items()
                                        if (len(cn._get_waiters) != 0 and not cn._get_waiters[0].triggered)}
 
             waiting_task_nr = len(waiting_task_cn_mapping)
-            if rest_life_periods <= 0:
-                if waiting_task_nr != 0:
-                    self.debug("block %d end of life, with waiting tasks: " % block_id,
-                               list(waiting_task_cn_mapping.keys()))
-                    for task_id, cn in waiting_task_cn_mapping.items():
-                        assert len(cn._get_waiters) == 1
-                        # avoid getter triggered by cn
-                        waiting_evt = cn._get_waiters.pop(0)
-                        waiting_evt.fail(StopReleaseDpError(
-                            "task %d rejected dp, due to block %d has stopped release" % (task_id, block_id)))
-                else:
-                    self.debug("block %d end of life, with NO waiting task" % block_id)
-
-                this_block["is_dead"] = True
-                return
 
             # active waiting task may get reduced
             # copy, to avoid iterate over a changing dictionary
@@ -786,13 +770,45 @@ class ResourceMaster(Component):
 
                 for tid, dp_alloc_amount in final_allocation.items():
                     cn = this_block["accum_containers"][tid]
-                    cn.put(dp_alloc_amount)
+                    get_amount = cn._get_waiters[0].amount
+                    if dp_alloc_amount < get_amount - cn.level < dp_alloc_amount + NUMERICAL_DELTA:
+                        cn.put(get_amount - cn.level)
+                    else:
+                        cn.put(dp_alloc_amount)
                     # finish put all
                     if dp_alloc_amount == desired_dp[tid]:
                         # getter should be triggered when putter is processed
                         assert cn.level == cn._get_waiters[0].amount
             else:
                 is_active = False
+
+            if rest_life_periods != 1:
+                yield self.clock_tick()
+                rest_life_periods = this_block["end_of_life"] - self.env.now + 1
+            else:
+                # last period of life, no sleep
+                # wait for get event processed
+                yield self.env.timeout(delay=0)
+                break
+
+        waiting_task_cn_mapping = {tid: cn for tid, cn in this_block["accum_containers"].items()
+                                   if (len(cn._get_waiters) != 0 and not cn._get_waiters[0].triggered)}
+
+        if len(waiting_task_cn_mapping) != 0:
+            self.debug("block %d last period of lifetime, with waiting tasks: " % block_id,
+                       list(waiting_task_cn_mapping.keys()))
+            for task_id, cn in waiting_task_cn_mapping.items():
+                assert len(cn._get_waiters) == 1
+                # avoid getter triggered by cn
+                waiting_evt = cn._get_waiters.pop(0)
+                waiting_evt.fail(StopReleaseDpError(
+                    "task %d rejected dp, due to block %d has stopped release" % (task_id, block_id)))
+        else:
+            self.debug("block %d out of life, with NO waiting task" % block_id)
+
+        this_block["is_dead"] = True
+
+        return
 
     def generate_datablocks_loop(self):
         cur_block_nr = 0
@@ -1177,6 +1193,7 @@ class Tasks(Component):
         def wait_for_dp(task_id, dp_committed_event):
 
             assert not dp_committed_event.triggered
+            t0 = self.env.now
             try:
                 yield dp_committed_event
                 dp_committed_time = self.resource_master.task_state[task_id]["dp_commit_timestamp"] = self.env.now
@@ -1245,7 +1262,7 @@ class Tasks(Component):
         if self.db:
             # verify iff cp commit fail <=> no publish
             if self.resource_master.task_state[task_id]["task_publish_timestamp"] is None:
-                assert self.resource_master.task_state[task_id]["dp_commit_timestamp"] < 0
+                assert self.resource_master.task_state[task_id]["dp_commit_timestamp"] <= 0
 
             if self.resource_master.task_state[task_id]["dp_commit_timestamp"] < 0:
                 assert self.resource_master.task_state[task_id]["task_publish_timestamp"] is None
@@ -1377,7 +1394,7 @@ if __name__ == '__main__':
         'resource_master.block.init_amount': 20,
         'resource_master.block.arrival_interval': 100,
         # 'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
-        'resource_master.dp_policy.rate_policy.lifetime': 10,
+        'resource_master.dp_policy.rate_policy.lifetime': 300,
 
         # 'resource_master.dp_policy': FCFS_POLICY,
         'resource_master.dp_policy': DP_POLICY_DPF,
