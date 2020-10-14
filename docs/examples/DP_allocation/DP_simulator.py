@@ -322,7 +322,7 @@ class ResourceMaster(Component):
             assert set(new_arrival_tid) <= set(self.resource_waiting_tasks.items)
 
             task_sched_order = None
-            # optimization for case with only new arrival task(s)
+            # optimization for case with only new arrival task(s), fcfs
             if len(new_arrival_msgs) == len(msgs):
                 task_sched_order = new_arrival_tid
             # otherwise, iterate over all sleeping tasks to sched.
@@ -587,10 +587,19 @@ class ResourceMaster(Component):
         elif self.is_dp_policy_rate:
 
             for i in resource_demand["block_idx"]:
-                # need to wait get on own accum containers
-                accum_cn = DummyPutPool(self.env, capacity=resource_demand["epsilon"], init=0.0)
-                this_task["accum_getters"][i] = accum_cn.get(resource_demand["epsilon"])
-                self.block_dp_storage.items[i]["accum_containers"][task_id] = accum_cn
+                if self.block_dp_storage.items[i]['is_dead']:
+                    # interrupt dp_waiting_proc
+                    if this_task["handler_proc_resource"].is_alive:
+                        this_task["handler_proc_resource"].interrupt(self._DP_HANDLER_INTERRUPT_MSG)
+                    dp_committed_event.fail(
+                        StopReleaseDpError("task %d rejected dp, due to block %d has stopped release" % (task_id, i)))
+                    return
+            else:
+                for i in resource_demand["block_idx"]:
+                    # need to wait get on own accum containers
+                    accum_cn = DummyPutPool(self.env, capacity=resource_demand["epsilon"], init=0.0)
+                    this_task["accum_getters"][i] = accum_cn.get(resource_demand["epsilon"])
+                    self.block_dp_storage.items[i]["accum_containers"][task_id] = accum_cn
 
             all_getter = self.env.all_of(list(this_task["accum_getters"].values()))
 
@@ -599,7 +608,7 @@ class ResourceMaster(Component):
                 self.debug(task_id, "get all dp from blocks")
 
             except (StopReleaseDpError, InsufficientDpException) as err:
-                self.debug(task_id, "policy=%s, fail to acquire dp due to [%s]" % (self.dp_policy, err))
+                self.debug(task_id, "policy=%s, fail to acquire dp due to" % self.dp_policy, err.__repr__())
                 # interrupt dp_waiting_proc
                 if this_task["handler_proc_resource"].is_alive:
                     this_task["handler_proc_resource"].interrupt(self._DP_HANDLER_INTERRUPT_MSG)
@@ -720,20 +729,24 @@ class ResourceMaster(Component):
 
         while True:
             yield self.clock_tick()
-            rest_of_life = this_block["end_of_life"] - self.env.now + 1
+            rest_life_periods = this_block["end_of_life"] - self.env.now + 1
 
             waiting_task_cn_mapping = {tid: cn for tid, cn in this_block["accum_containers"].items()
                                        if (len(cn._get_waiters) != 0 and not cn._get_waiters[0].triggered)}
 
             waiting_task_nr = len(waiting_task_cn_mapping)
-            if rest_of_life <= 0:
+            if rest_life_periods <= 0:
                 if waiting_task_nr != 0:
-                    self.debug(block_id, "end of life, with %d waiting tasks' demand" % waiting_task_nr)
+                    self.debug("block %d end of life, with waiting tasks: " % block_id,
+                               list(waiting_task_cn_mapping.keys()))
                     for task_id, cn in waiting_task_cn_mapping.items():
                         assert len(cn._get_waiters) == 1
                         # avoid getter triggered by cn
                         waiting_evt = cn._get_waiters.pop(0)
-                        waiting_evt.fail(StopReleaseDpError(task_id, block_id, "release DP has stopped"))
+                        waiting_evt.fail(StopReleaseDpError(
+                            "task %d rejected dp, due to block %d has stopped release" % (task_id, block_id)))
+                else:
+                    self.debug("block %d end of life, with NO waiting task" % block_id)
 
                 this_block["is_dead"] = True
                 return
@@ -755,7 +768,7 @@ class ResourceMaster(Component):
             if len(waiting_task_cn_mapping) > 0:
                 # activate block/ renew rate
                 if not is_active:
-                    rate = this_block["dp_container"].level / rest_of_life
+                    rate = this_block["dp_container"].level / rest_life_periods
                     is_active = True
 
                 assert (this_block["dp_container"].level / rate) > (1 - NUMERICAL_DELTA)
@@ -1363,12 +1376,12 @@ if __name__ == '__main__':
         'resource_master.block.init_epsilon': 10.0,
         'resource_master.block.init_amount': 20,
         'resource_master.block.arrival_interval': 100,
-        # 'resource_master.dp_policy': POLICY_RATE_LIMIT,
-        # 'resource_master.dp_policy.rate_policy.lifetime': 300,
+        # 'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
+        'resource_master.dp_policy.rate_policy.lifetime': 10,
 
         # 'resource_master.dp_policy': FCFS_POLICY,
         'resource_master.dp_policy': DP_POLICY_DPF,
-        'resource_master.dp_policy.dpf.denominator': 2,
+        'resource_master.dp_policy.dpf.denominator': 5,
         # https://cloud.google.com/compute/docs/gpus
         # V100 VM instance
         'resource_master.is_cpu_needed_only': True,
@@ -1490,13 +1503,13 @@ if __name__ == '__main__':
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_dpf"
     config2["resource_master.dp_policy"] = DP_POLICY_DPF
-
+    config2["resource_master.dp_policy.dpf.denominator"] = 2
     configs.append(config2)
 
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_rate_limiting"
     config2["resource_master.dp_policy"] = DP_POLICY_RATE_LIMIT
-    config2["resource_master.dp_policy.rate_policy.lifetime"] = 300
+    config2["resource_master.dp_policy.rate_policy.lifetime"] = 10
 
     configs.append(config2)
 
