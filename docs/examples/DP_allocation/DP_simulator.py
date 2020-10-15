@@ -55,7 +55,9 @@ NEW_TASK = "new_task_created"
 
 DP_POLICY_FCFS = "fcfs2342"
 DP_POLICY_RATE_LIMIT = "rate123"
-DP_POLICY_DPF = "dynamic_DPF234"
+DP_POLICY_DPF = "dynamic_DPF234"  # task arrival based quota accumulation
+DP_POLICY_DPF_T = "dynamic_DPF_T_234"  # task time based quota accumulation
+DP_POLICY_DPF_A = "dynamic_DPF_A_234"  # adaptive task arrival based quota accumulation
 TIMEOUT_VAL = "timeout_triggered543535"
 NUMERICAL_DELTA = 1e-5
 TIMEOUT_TOLERATE = 0.01
@@ -233,10 +235,12 @@ class ResourceMaster(Component):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.add_connections('global_clock')
-
+        self._retired_blocks = set()
         self.dp_policy = self.env.config["resource_master.dp_policy"]
         self.is_dp_policy_fcfs = self.dp_policy == DP_POLICY_FCFS
         self.is_dp_policy_dpf = self.dp_policy == DP_POLICY_DPF
+        self.is_dp_policy_dpft = self.dp_policy == DP_POLICY_DPF_T
+
         self.is_dp_policy_rate = self.dp_policy == DP_POLICY_RATE_LIMIT
 
         self.unused_dp = DummyPool(self.env)
@@ -265,6 +269,10 @@ class ResourceMaster(Component):
         self.mail_box = DummyPutQueue(self.env)
         # make sure get event happens at the last of event queue at current epoch.
         self.resource_sched_mail_box = DummyPutLazyAnyFilterQueue(self.env)
+        # two types of item in mail box:
+        # 1. a list of block ids whose quota get incremented,
+        # 2. new arrival task id
+        self.dp_sched_mail_box = DummyPutLazyAnyFilterQueue(self.env)
 
         self.task_state = dict()  # {task_id:{...},...,}
         # for rate limiting dp scheduling, distributed dp schedulers init in loop
@@ -312,7 +320,7 @@ class ResourceMaster(Component):
 
             yield self.resource_sched_mail_box.when_any()
             # ensure the scheduler is really lazy to process getter
-            assert self.env.peek() != self.env.now
+            assert self.env.peek() != self.env.now or self.env._queue[0][1] == LazyAnyFilterQueue.LAZY
             # fake door bell, listen again
             if len(self.resource_sched_mail_box.items) == 0:
                 continue
@@ -403,21 +411,37 @@ class ResourceMaster(Component):
         # calculate DR share, match, allocate,
         # update DRS if new quota has over lap with tasks
         while True:
-            dp_request_arrival_event = self.env.event()
-            self.dp_waiting_tasks._put_hook = lambda: dp_request_arrival_event.succeed()
-            yield dp_request_arrival_event
+
+            yield self.dp_sched_mail_box.when_any()
+            # ensure the scheduler is really lazy to process getter, wait for all quota incremented
+            assert self.env.peek() != self.env.now or self.env._queue[0][1] == LazyAnyFilterQueue.LAZY
+            # fake door bell, listen again
+            if len(self.resource_sched_mail_box.items) == 0:
+                continue
+            mail_box = self.dp_sched_mail_box
+            msgs = list(mail_box.get(filter=lambda x: True).value for _ in range(len(mail_box.items)))
+
+            new_arrival_tid = []
+            incremented_quota_idx = set()
+            for m in msgs:
+                if isinstance(m, int):
+                    assert m in self.dp_waiting_tasks.items
+                    new_arrival_tid.append(m)
+                else:
+                    assert isinstance(m, list)
+                    incremented_quota_idx.update(m)
+
             this_epoch_unused_quota = [block['dp_quota'].level for block in self.block_dp_storage.items]
             # new task arrived
             new_task_id = self.dp_waiting_tasks.items[-1]
-            assert self.task_state[new_task_id]['dominant_resource_share'] is None
+            for new_task_id in new_arrival_tid:
+                assert self.task_state[new_task_id]['dominant_resource_share'] is None
 
-            incremented_quota_idx = set(self.task_state[new_task_id]["resource_request"]['block_idx']) - set(
-                self.task_state[new_task_id]['retired_blocks'])
-
-            # should update DRS of last new task if it demands any non-retired block
+            # update DRS of tasks if its demands has any incremented quota, or new comming tasks.
             for t_id in self.dp_waiting_tasks.items:
                 # update DRS
-                if set(self.task_state[t_id]["resource_request"]['block_idx']) & incremented_quota_idx:
+                if (set(self.task_state[t_id]["resource_request"]['block_idx']) & incremented_quota_idx) or \
+                        self.task_state[new_task_id]['dominant_resource_share'] is None:
                     resource_shares = []
                     for i in self.task_state[new_task_id]["resource_request"]['block_idx']:
                         rs = self.task_state[t_id]["resource_request"]['epsilon'] / (
@@ -426,10 +450,18 @@ class ResourceMaster(Component):
                         resource_shares.append(rs)
                 self.task_state[t_id]['dominant_resource_share'] = max(resource_shares)
 
+            if len(incremented_quota_idx) != 0:
+                permit_dp_task_order = sorted(self.dp_waiting_tasks.items, reverse=False,
+                                              key=lambda t_id: self.task_state[t_id]['dominant_resource_share'])
+            # optimization for no new quota case
+            else:
+                permit_dp_task_order = sorted(new_arrival_tid, reverse=False,
+                                              key=lambda t_id: self.task_state[t_id]['dominant_resource_share'])
+
             # iterate over tasks ordered by DRS, match quota, allocate.
             dp_permitted_task_ids = set()
-            for t_id in sorted(self.dp_waiting_tasks.items, reverse=False,
-                               key=lambda t_id: self.task_state[t_id]['dominant_resource_share']):
+
+            for t_id in permit_dp_task_order:
                 drs = self.task_state[t_id]['dominant_resource_share']
                 assert drs is not None
                 this_task = self.task_state[t_id]
@@ -438,15 +470,12 @@ class ResourceMaster(Component):
                 task_demand_epsilon = self.task_state[t_id]["resource_request"]['epsilon']
 
                 for b_idx in task_demand_block_idx:
-
                     block_unused_quota = this_epoch_unused_quota[b_idx]
                     if block_unused_quota < task_demand_epsilon:
                         break
-
                 # task is permitted
                 else:
                     self.debug(t_id, "DP permitted, DRS: %.3f" % drs)
-
                     for i in task_demand_block_idx:
                         this_epoch_unused_quota[i] -= task_demand_epsilon
                     this_task["dp_permitted_event"].succeed()
@@ -552,7 +581,8 @@ class ResourceMaster(Component):
         elif self.is_dp_policy_dpf:
 
             # quota increment
-            retired_blocks = []
+            this_epoch_retired_blocks = []
+            quota_increment_idx = []
             for i in resource_demand["block_idx"]:
                 self.block_dp_storage.items[i]["arrived_task_num"] += 1
                 if not self.block_dp_storage.items[i]["is_retired"]:
@@ -565,15 +595,19 @@ class ResourceMaster(Component):
                         get_amount = quota_increment
                     self.block_dp_storage.items[i]['dp_container'].get(get_amount)
                     self.block_dp_storage.items[i]['dp_quota'].put(quota_increment)
+                    quota_increment_idx.append(i)
                     if self.block_dp_storage.items[i]["arrived_task_num"] == self.denom:
                         self.block_dp_storage.items[i]["is_retired"] = True
-                        retired_blocks.append(i)
+                        this_epoch_retired_blocks.append(i)
                 else:
                     self.task_state[task_id]['retired_blocks'].append(i)
-            if len(retired_blocks):
-                self.debug(task_id, 'blocks get retired: ', retired_blocks)
+            if len(this_epoch_retired_blocks):
+                self.debug(task_id, 'blocks get retired: ', this_epoch_retired_blocks)
 
             self.dp_waiting_tasks.put(task_id)
+            self.dp_sched_mail_box.put(task_id)
+            self.dp_sched_mail_box.put(quota_increment_idx)
+
             self.debug(task_id, "fairshare epsilon: %0.2f" % (
                     self.env.config['resource_master.block.init_epsilon'] / self.env.config[
                 'resource_master.dp_policy.dpf.denominator']))
@@ -1544,11 +1578,11 @@ if __name__ == '__main__':
 
     configs = []
 
-    config2 = copy.deepcopy(config1)
-    config2["sim.workspace"] = "workspace_fcfs"
-    config2["resource_master.dp_policy"] = DP_POLICY_FCFS
-
-    configs.append(config2)
+    # config2 = copy.deepcopy(config1)
+    # config2["sim.workspace"] = "workspace_fcfs"
+    # config2["resource_master.dp_policy"] = DP_POLICY_FCFS
+    #
+    # configs.append(config2)
 
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_dpf"
@@ -1556,12 +1590,12 @@ if __name__ == '__main__':
     config2["resource_master.dp_policy.dpf.denominator"] = 17
     configs.append(config2)
 
-    config2 = copy.deepcopy(config1)
-    config2["sim.workspace"] = "workspace_rate_limiting"
-    config2["resource_master.dp_policy"] = DP_POLICY_RATE_LIMIT
-    config2["resource_master.dp_policy.rate_policy.lifetime"] = 10
-
-    configs.append(config2)
+    # config2 = copy.deepcopy(config1)
+    # config2["sim.workspace"] = "workspace_rate_limiting"
+    # config2["resource_master.dp_policy"] = DP_POLICY_RATE_LIMIT
+    # config2["resource_master.dp_policy.rate_policy.lifetime"] = 10
+    #
+    # configs.append(config2)
 
     if run_test_many:
         for c in configs:
