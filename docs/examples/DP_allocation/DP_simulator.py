@@ -244,6 +244,7 @@ class ResourceMaster(Component):
         self.is_dp_policy_fcfs = self.dp_policy == DP_POLICY_FCFS
         self.is_dp_policy_dpf = self.dp_policy == DP_POLICY_DPF
         self.is_dp_policy_dpft = self.dp_policy == DP_POLICY_DPF_T
+        self.is_dp_policy_dpfa = self.dp_policy == DP_POLICY_DPF_A
 
         self.is_dp_policy_rate = self.dp_policy == DP_POLICY_RATE_LIMIT
 
@@ -297,7 +298,7 @@ class ResourceMaster(Component):
         if self.is_dp_policy_dpf:
             self.denom = self.env.config['resource_master.dp_policy.dpf.denominator']
         # for quota based policy
-        if self.is_dp_policy_dpf or self.is_dp_policy_dpft:
+        if self.is_dp_policy_dpf or self.is_dp_policy_dpft or self.is_dp_policy_dpfa:
             self.add_processes(self.scheduling_dp_loop)
 
         self.add_processes(self.scheduling_resources_loop)
@@ -390,7 +391,7 @@ class ResourceMaster(Component):
             # sched dp waiting tasks
             if self.is_dp_policy_fcfs or self.is_dp_policy_rate:
                 sleeping_dp_waiting_sched_order = fcfs_sleeping_dp_waiting_tasks
-            elif self.is_dp_policy_dpf or self.is_dp_policy_dpft:
+            elif self.is_dp_policy_dpf or self.is_dp_policy_dpft or self.is_dp_policy_dpfa:
                 # smallest dominant_resource_share task first
                 sleeping_dp_waiting_sched_order = sorted(fcfs_sleeping_dp_waiting_tasks, reverse=False,
                                                          key=lambda t_id: self.task_state[t_id][
@@ -605,16 +606,20 @@ class ResourceMaster(Component):
             for i in resource_demand["block_idx"]:
                 self.block_dp_storage.items[i]["dp_container"].get(resource_demand["epsilon"])
 
+        elif self.is_dp_policy_dpft:
+            # dp_policy_dpft only needs enqueue
+            self.dp_waiting_tasks.put(task_id)
+            self.dp_sched_mail_box.put(task_id)
 
         # appliable to other policies controlled by another (centralized) processes
-        elif self.is_dp_policy_dpf or self.is_dp_policy_dpft:
-            if self.is_dp_policy_dpf:
-                # quota increment
-                this_epoch_retired_blocks = []
-                quota_increment_idx = []
-                for i in resource_demand["block_idx"]:
-                    self.block_dp_storage.items[i]["arrived_task_num"] += 1
-                    if not self.block_dp_storage.items[i]["is_retired"]:
+        if self.is_dp_policy_dpf or self.is_dp_policy_dpfa:
+            # quota increment
+            this_epoch_retired_blocks = []
+            quota_increment_idx = []
+            for i in resource_demand["block_idx"]:
+                self.block_dp_storage.items[i]["arrived_task_num"] += 1
+                if not self.block_dp_storage.items[i]["is_retired"]:
+                    if self.is_dp_policy_dpf:
                         quota_increment = self.env.config["resource_master.block.init_epsilon"] / self.denom
                         assert quota_increment < self.block_dp_storage.items[i]['dp_container'].level + NUMERICAL_DELTA
                         if -NUMERICAL_DELTA < quota_increment - self.block_dp_storage.items[i][
@@ -622,22 +627,41 @@ class ResourceMaster(Component):
                             get_amount = self.block_dp_storage.items[i]['dp_container'].level
                         else:
                             get_amount = quota_increment
-                        self.block_dp_storage.items[i]['dp_container'].get(get_amount)
-                        self.block_dp_storage.items[i]['dp_quota'].put(quota_increment)
-                        quota_increment_idx.append(i)
+
                         if self.block_dp_storage.items[i]["arrived_task_num"] == self.denom:
                             self.block_dp_storage.items[i]["is_retired"] = True
                             this_epoch_retired_blocks.append(i)
-                if len(this_epoch_retired_blocks):
-                    self.debug(task_id, 'blocks get retired: ', this_epoch_retired_blocks)
-                self.dp_sched_mail_box.put(quota_increment_idx)
-                self.debug(task_id, "fairshare epsilon: %0.2f" % (
-                        self.env.config['resource_master.block.init_epsilon'] / self.env.config[
-                    'resource_master.dp_policy.dpf.denominator']))
 
-            # dp_policy_dpft only needs enqueue
+                        if len(this_epoch_retired_blocks):
+                            self.debug(task_id, 'blocks get retired: ', this_epoch_retired_blocks)
+                        self.debug(task_id, "fairshare epsilon: %0.2f" % (
+                                self.env.config['resource_master.block.init_epsilon'] / self.env.config[
+                            'resource_master.dp_policy.dpf.denominator']))
+
+                    elif self.is_dp_policy_dpfa:
+                        # last_arrival_time = self.block_dp_storage.items[i]["last_task_arrival_time"]
+                        self.block_dp_storage.items[i]["last_task_arrival_time"] = self.env.now
+                        age = self.env.now - self.block_dp_storage.items[i]["create_time"]
+                        if age < self.env.config['resource_master.block.lifetime']:
+                            target_quota = age / self.env.config['resource_master.block.lifetime'] * self.env.config[
+                                "resource_master.block.init_epsilon"]
+                            released_quota = self.env.config["resource_master.block.init_epsilon"] - \
+                                             self.block_dp_storage.items[i]['dp_container'].level
+                            get_amount = target_quota - released_quota
+                        else:
+                            assert age == self.env.config['resource_master.block.lifetime']
+                            # let block's callback handle
+                            continue
+
+                    if get_amount > 0:
+                        self.block_dp_storage.items[i]['dp_container'].get(get_amount)
+                        self.block_dp_storage.items[i]['dp_quota'].put(get_amount)
+
+                    quota_increment_idx.append(i)
+
             self.dp_waiting_tasks.put(task_id)
             self.dp_sched_mail_box.put(task_id)
+            self.dp_sched_mail_box.put(quota_increment_idx)
 
             unused_dp = {}
             for i, block in enumerate(self.block_dp_storage.items):
@@ -972,7 +996,7 @@ class ResourceMaster(Component):
             total_dp = self.env.config['resource_master.block.init_epsilon']
             new_block = DummyPool(self.env, capacity=total_dp, init=total_dp, name=cur_block_id, hard_cap=True)
 
-            if self.is_dp_policy_dpf or self.is_dp_policy_dpft:
+            if self.is_dp_policy_dpf or self.is_dp_policy_dpft or self.is_dp_policy_dpfa:
                 new_quota = DummyPool(self.env, capacity=total_dp, init=0, name=cur_block_id, hard_cap=True)
                 is_retired = False
                 arrived_task_num = 0
@@ -983,13 +1007,13 @@ class ResourceMaster(Component):
                 arrived_task_num = None
 
             if self.is_dp_policy_rate:
-                EOL = self.env.now + self.env.config['resource_master.dp_policy.rate_policy.lifetime']
+                EOL = self.env.now + self.env.config['resource_master.block.lifetime']
                 accum_cn_dict = dict()
                 is_dead = False
-            elif self.is_dp_policy_dpft:
-                EOL = self.env.now + self.env.config['resource_master.dp_policy.dpft.lifetime']
+            elif self.is_dp_policy_dpft or self.is_dp_policy_dpfa:
+                EOL = self.env.now + self.env.config['resource_master.block.lifetime']
                 accum_cn_dict = None
-                is_dead = False
+                is_dead = None
             else:
                 EOL = None
                 accum_cn_dict = None
@@ -1004,7 +1028,21 @@ class ResourceMaster(Component):
                 'is_dead': is_dead,
                 'is_retired': is_retired,
                 'arrived_task_num': arrived_task_num,
+                'last_task_arrival_time': None,
+                'create_time': self.env.now,
             }
+
+            def callback_warpper(b_idx, cn, quota):
+                def eol_callback(eol):
+                    lvl = cn.level
+                    cn.get(lvl)
+                    quota.put(lvl)
+                    assert cn.level == 0
+                    self.dp_sched_mail_box.put([b_idx])
+                    self.block_dp_storage.items[b_idx]['is_retired'] = True
+                    self.debug('block %d EOF, move remaining dp from container to quota' % b_idx)
+
+                return eol_callback
 
             self.block_dp_storage.put(block_item)
             self.unused_dp.put(total_dp)
@@ -1014,6 +1052,10 @@ class ResourceMaster(Component):
                 self.env.process(self.scheduling_dp_subloop_rate_release(cur_block_id))
             elif self.is_dp_policy_dpft:
                 self.env.process(self.scheduling_dp_subloop_release_quota(cur_block_id))
+            if self.is_dp_policy_dpfa:
+                eol_event = self.env.timeout(self.env.config['resource_master.block.lifetime'])
+                eol_event.callbacks.append(
+                    callback_warpper(self.block_dp_storage.items.index(block_item), new_block, new_quota))
 
     def _commit_dp_allocation(self, block_idx: List[int], epsilon: float):
         """
@@ -1040,17 +1082,24 @@ class ResourceMaster(Component):
         self.unused_dp.get(epsilon * len(block_idx))
         self.committed_dp.put(epsilon * len(block_idx))
         unused_dp = {}
-        for i, block in enumerate(self.block_dp_storage.items):
-            if i in block_idx:
-                unused_dp[i] = -round(block['dp_quota'].level,
-                                      2) if self.is_dp_policy_dpf or self.is_dp_policy_dpft else -round(
-                    block['dp_container'].capacity, 2)
-            else:
-                unused_dp[i] = round(block['dp_quota'].level,
-                                     2) if self.is_dp_policy_dpf or self.is_dp_policy_dpft else round(
-                    block['dp_container'].capacity, 2)
+
+        if self.is_dp_policy_dpf or self.is_dp_policy_dpft or self.is_dp_policy_dpfa:
+            for i, block in enumerate(self.block_dp_storage.items):
+                if i in block_idx:
+                    unused_dp[i] = -round(block['dp_quota'].level, 2)
+                else:
+                    unused_dp[i] = round(block['dp_quota'].level, 2)
+
+        else:
+            for i, block in enumerate(self.block_dp_storage.items):
+                # uncommitted dp
+                if i in block_idx:
+                    unused_dp[i] = -round(block['dp_container'].capacity, 2)
+                else:
+                    unused_dp[i] = round(block['dp_container'].capacity, 2)
+
         if self.env.config['workload_test.enabled']:
-            if not (self.is_dp_policy_dpf or self.is_dp_policy_dpft):
+            if not (self.is_dp_policy_dpf or self.is_dp_policy_dpft or self.is_dp_policy_dpfa):
                 self.debug("unused dp after commit: %s" % pp.pformat(unused_dp))
             else:
                 self.debug("unused dp quota after commit: %s" % pp.pformat(unused_dp))
@@ -1507,7 +1556,7 @@ if __name__ == '__main__':
     run_test_parallel = False
 
     config = {
-        'workload_test.enabled': True,
+        'workload_test.enabled': False,
         'workload_test.static_blocks_num': 5,
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
         'task.arrival_interval': 10,
@@ -1534,7 +1583,7 @@ if __name__ == '__main__':
         'resource_master.block.init_amount': 20,
         'resource_master.block.arrival_interval': 100,
         # 'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
-        'resource_master.dp_policy.rate_policy.lifetime': 300,  # in sec
+        'resource_master.block.lifetime': 300,  # in sec
         'resource_master.dp_policy.dpf_family.dominant_resource_share': DRS_DEFAULT,  # DRS_L2
 
         # 'resource_master.dp_policy': FCFS_POLICY,
@@ -1633,13 +1682,13 @@ if __name__ == '__main__':
     scheduler_configs["fcfs_policy"] = {'resource_master.dp_policy': DP_POLICY_FCFS}
 
     scheduler_configs["rate_policy_slow_release"] = {'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
-                                                     'resource_master.dp_policy.rate_policy.lifetime': config1[
-                                                                                                           'task.arrival_interval'] * 10 * 5
+                                                     'resource_master.block.lifetime': config1[
+                                                                                           'task.arrival_interval'] * 10 * 5
                                                      # 500
                                                      }
     scheduler_configs["rate_policy_fast_release"] = {'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
-                                                     'resource_master.dp_policy.rate_policy.lifetime': config1[
-                                                                                                           'task.arrival_interval'] * 5}  # 50
+                                                     'resource_master.block.lifetime': config1[
+                                                                                           'task.arrival_interval'] * 5}  # 50
     dp_factor_names = set()
     for sched_conf_k, sched_conf_v in scheduler_configs.items():
         for conf_factor in sched_conf_v:
@@ -1668,14 +1717,19 @@ if __name__ == '__main__':
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_dpft"
     config2["resource_master.dp_policy"] = DP_POLICY_DPF_T
-    config2["resource_master.dp_policy.dpft.lifetime"] = 300
+    config2["resource_master.block.lifetime"] = 300
     configs.append(config2)
 
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_rate_limiting"
     config2["resource_master.dp_policy"] = DP_POLICY_RATE_LIMIT
-    config2["resource_master.dp_policy.rate_policy.lifetime"] = 300
+    config2["resource_master.block.lifetime"] = 300
+    configs.append(config2)
 
+    config2 = copy.deepcopy(config1)
+    config2["sim.workspace"] = "workspace_dpfa"
+    config2["resource_master.dp_policy"] = DP_POLICY_DPF_A
+    config2["resource_master.block.lifetime"] = 300
     configs.append(config2)
 
     if run_test_many:
