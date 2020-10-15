@@ -156,9 +156,12 @@ class Top(Component):
         super().__init__(*args, **kwargs)
         self.tasks = Tasks(self)
         self.resource_master = ResourceMaster(self)
+        self.global_clock = Clock(3, self)
 
     def connect_children(self):
         self.connect(self.tasks, 'resource_master')
+        self.connect(self.tasks, 'global_clock')
+        self.connect(self.resource_master, 'global_clock')
 
     @classmethod
     def pre_init(cls, env):
@@ -197,6 +200,24 @@ class Top(Component):
         generate_dot(self)
 
 
+class Clock(Component):
+    base_name = 'clock'
+
+    def __init__(self, tick_period, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.tick_period = tick_period
+        self.ticking_proc = self.env.process(self.ticking())
+
+    def ticking(self):
+        while True:
+            yield self.env.timeout(self.tick_period)
+
+    @property
+    def next_tick(self):
+        return self.ticking_proc.target
+
+
 class ResourceMaster(Component):
     """Model a grocery store with checkout lanes, cashiers, and baggers."""
 
@@ -211,6 +232,8 @@ class ResourceMaster(Component):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.add_connections('global_clock')
+
         self.dp_policy = self.env.config["resource_master.dp_policy"]
         self.is_dp_policy_fcfs = self.dp_policy == DP_POLICY_FCFS
         self.is_dp_policy_dpf = self.dp_policy == DP_POLICY_DPF
@@ -247,7 +270,6 @@ class ResourceMaster(Component):
         # for rate limiting dp scheduling, distributed dp schedulers init in loop
         self.add_processes(self.generate_datablocks_loop)
         self.add_processes(self.allocator_frontend_loop)
-        self.clock_period = 1
         self.debug("dp allocation policy %s" % self.dp_policy)
         # waiting for dp permission
         self.dp_waiting_tasks = DummyFilterQueue(self.env,
@@ -265,9 +287,6 @@ class ResourceMaster(Component):
             self.denom = self.env.config['resource_master.dp_policy.dpf.denominator']
 
         self.add_processes(self.scheduling_resources_loop)
-
-    def clock_tick(self):
-        return self.env.timeout(self.clock_period)
 
     def scheduling_resources_loop(self):
 
@@ -538,8 +557,12 @@ class ResourceMaster(Component):
                 self.block_dp_storage.items[i]["arrived_task_num"] += 1
                 if not self.block_dp_storage.items[i]["is_retired"]:
                     quota_increment = self.env.config["resource_master.block.init_epsilon"] / self.denom
-                    self.block_dp_storage.items[i]['dp_container'].level / quota_increment > 1 - NUMERICAL_DELTA
-                    get_amount = min(quota_increment, self.block_dp_storage.items[i]['dp_container'].level)
+                    assert quota_increment < self.block_dp_storage.items[i]['dp_container'].level + NUMERICAL_DELTA
+                    if -NUMERICAL_DELTA < quota_increment - self.block_dp_storage.items[i][
+                        'dp_container'].level < NUMERICAL_DELTA:
+                        get_amount = self.block_dp_storage.items[i]['dp_container'].level
+                    else:
+                        get_amount = quota_increment
                     self.block_dp_storage.items[i]['dp_container'].get(get_amount)
                     self.block_dp_storage.items[i]['dp_quota'].put(quota_increment)
                     if self.block_dp_storage.items[i]["arrived_task_num"] == self.denom:
@@ -561,7 +584,8 @@ class ResourceMaster(Component):
                     unused_dp[i] = -round(block['dp_quota'].level, 2)
                 else:
                     unused_dp[i] = round(block['dp_quota'].level, 2)
-            self.debug(task_id, "unused dp quota after arrival: %s" % pp.pformat(unused_dp))
+            if self.env.config['workload_test.enabled']:
+                self.debug(task_id, "unused dp quota after arrival: %s" % pp.pformat(unused_dp))
 
             try:
                 t0 = self.env.now
@@ -726,9 +750,10 @@ class ResourceMaster(Component):
         is_active = False
         rate = 0
         this_block = self.block_dp_storage.items[block_id]
-        # rest_life_periods
-        rest_life_periods = this_block["end_of_life"] - self.env.now + 1
-        while rest_life_periods > 0:
+
+        # due to discretization, shift release during 1 sec period to the start of this second.
+        # therefore, last release should happen before end of life
+        while self.env.now < this_block["end_of_life"]:
 
             waiting_task_cn_mapping = {tid: cn for tid, cn in this_block["accum_containers"].items()
                                        if (len(cn._get_waiters) != 0 and not cn._get_waiters[0].triggered)}
@@ -752,25 +777,36 @@ class ResourceMaster(Component):
             if len(waiting_task_cn_mapping) > 0:
                 # activate block/ renew rate
                 if not is_active:
-                    rate = this_block["dp_container"].level / rest_life_periods
+                    rate_per_sec = this_block["dp_container"].level / (this_block["end_of_life"] - self.env.now)
+                    rate = rate_per_sec * self.global_clock.tick_period
                     is_active = True
 
-                assert (this_block["dp_container"].level / rate) > (1 - NUMERICAL_DELTA)
-                get_amount = min(rate, this_block["dp_container"].level)
+                # should return after wakeup
+                if this_block["end_of_life"] - self.env.now <= self.global_clock.tick_period:
+                    rate = rate_per_sec * (this_block["end_of_life"] - self.env.now)
+                    assert rate < this_block["dp_container"].level + NUMERICAL_DELTA
+                    if -NUMERICAL_DELTA < this_block["dp_container"].level - rate < NUMERICAL_DELTA:
+                        get_amount = this_block["dp_container"].level
+                    else:
+                        get_amount = rate
+                else:
+                    get_amount = rate
+
                 this_block["dp_container"].get(get_amount)
 
                 desired_dp = {tid: cn.capacity - cn.level for tid, cn in waiting_task_cn_mapping.items()}
                 # self.debug(block_id, "call max_min_fair_allocation")
-                final_allocation = max_min_fair_allocation(desired=desired_dp, capacity=get_amount)
+                fair_allocation = max_min_fair_allocation(desired=desired_dp, capacity=get_amount)
 
                 # all waiting task is granted by this block, return back unused dp
-                if sum(final_allocation.values()) < get_amount:
-                    this_block["dp_container"].put(get_amount - sum(final_allocation.values()))
+                if sum(fair_allocation.values()) < get_amount:
+                    this_block["dp_container"].put(get_amount - sum(fair_allocation.values()))
                     is_active = False
 
-                for tid, dp_alloc_amount in final_allocation.items():
+                for tid, dp_alloc_amount in fair_allocation.items():
                     cn = this_block["accum_containers"][tid]
                     get_amount = cn._get_waiters[0].amount
+                    # fill to trigger get
                     if dp_alloc_amount < get_amount - cn.level < dp_alloc_amount + NUMERICAL_DELTA:
                         cn.put(get_amount - cn.level)
                     else:
@@ -782,15 +818,11 @@ class ResourceMaster(Component):
             else:
                 is_active = False
 
-            if rest_life_periods != 1:
-                yield self.clock_tick()
-                rest_life_periods = this_block["end_of_life"] - self.env.now + 1
-            else:
-                # last period of life, no sleep
-                # wait for get event processed
-                yield self.env.timeout(delay=0)
-                break
+            yield self.global_clock.next_tick
 
+        # now >= end of life
+        # wait for dp getter event processed, reject untriggered get
+        yield self.env.timeout(delay=0)
         waiting_task_cn_mapping = {tid: cn for tid, cn in this_block["accum_containers"].items()
                                    if (len(cn._get_waiters) != 0 and not cn._get_waiters[0].triggered)}
 
@@ -852,7 +884,7 @@ class ResourceMaster(Component):
                 arrived_task_num = None
 
             if self.is_dp_policy_rate:
-                EOL = self.env.now + self.env.config['resource_master.dp_policy.rate_policy.lifetime'] - 1
+                EOL = self.env.now + self.env.config['resource_master.dp_policy.rate_policy.lifetime']
                 accum_cn_dict = dict()
                 is_dead = False
             else:
@@ -910,11 +942,11 @@ class ResourceMaster(Component):
             else:
                 unused_dp[i] = round(block['dp_quota'].level, 2) if self.is_dp_policy_dpf else round(
                     block['dp_container'].capacity, 2)
-
-        if not self.is_dp_policy_dpf:
-            self.debug("unused dp after commit: %s" % pp.pformat(unused_dp))
-        else:
-            self.debug("unused dp quota after commit: %s" % pp.pformat(unused_dp))
+        if self.env.config['workload_test.enabled']:
+            if not self.is_dp_policy_dpf:
+                self.debug("unused dp after commit: %s" % pp.pformat(unused_dp))
+            else:
+                self.debug("unused dp quota after commit: %s" % pp.pformat(unused_dp))
 
     def get_result_hook(self, result):
         if self.env.tracemgr.vcd_tracer.enabled:
@@ -963,6 +995,8 @@ class Tasks(Component):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.add_connections('resource_master')
+        self.add_connections('global_clock')
+
         self.add_process(self.generate_tasks)
 
         self.task_unpublished_count = DummyPool(self.env)
@@ -1161,11 +1195,10 @@ class Tasks(Component):
                 self.task_running_count.get(1)
                 self.task_completed_count.put(1)
 
-            core_running_task.callbacks.append(post_completion_callback)
-
             try:
                 # running task
                 yield core_running_task
+                post_completion_callback(core_running_task)
 
                 return 0
 
@@ -1367,7 +1400,7 @@ if __name__ == '__main__':
     run_test_parallel = False
 
     config = {
-        'workload_test.enabled': True,
+        'workload_test.enabled': False,
         'workload_test.static_blocks_num': 5,
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
         'task.arrival_interval': 10,
@@ -1394,7 +1427,7 @@ if __name__ == '__main__':
         'resource_master.block.init_amount': 20,
         'resource_master.block.arrival_interval': 100,
         # 'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
-        'resource_master.dp_policy.rate_policy.lifetime': 300,
+        'resource_master.dp_policy.rate_policy.lifetime': 300,  # in sec
 
         # 'resource_master.dp_policy': FCFS_POLICY,
         'resource_master.dp_policy': DP_POLICY_DPF,
@@ -1520,7 +1553,7 @@ if __name__ == '__main__':
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_dpf"
     config2["resource_master.dp_policy"] = DP_POLICY_DPF
-    config2["resource_master.dp_policy.dpf.denominator"] = 2
+    config2["resource_master.dp_policy.dpf.denominator"] = 17
     configs.append(config2)
 
     config2 = copy.deepcopy(config1)
