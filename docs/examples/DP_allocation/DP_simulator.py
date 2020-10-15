@@ -61,6 +61,10 @@ DP_POLICY_DPF_A = "dynamic_DPF_A_234"  # adaptive task arrival based quota accum
 TIMEOUT_VAL = "timeout_triggered543535"
 NUMERICAL_DELTA = 1e-5
 TIMEOUT_TOLERATE = 0.01
+DRS_DEFAULT = 'default_def_DRS'
+DRS_L2 = 'L2_norm_def_DRS'
+DRS_L1 = 'L1_norm_def_DRS'
+DRS_L_INF = 'L_inf_norm_def_DRS'
 
 
 class NoneBlockingPutMixin(object):
@@ -439,21 +443,41 @@ class ResourceMaster(Component):
                 assert self.task_state[new_task_id]['dominant_resource_share'] is None
 
             # update DRS of tasks if its demands has any incremented quota, or new comming tasks.
-            for t_id in self.dp_waiting_tasks.items:
-                # update DRS
-                if (set(self.task_state[t_id]["resource_request"]['block_idx']) & incremented_quota_idx) or \
-                        self.task_state[t_id]['dominant_resource_share'] is None:
-                    resource_shares = []
-                    for i in self.task_state[t_id]["resource_request"]['block_idx']:
-                        quota_amount = self.env.config["resource_master.block.init_epsilon"] - \
-                                       self.block_dp_storage.items[i]['dp_container'].level
-                        if quota_amount:
-                            rs = self.task_state[t_id]["resource_request"]['epsilon'] / quota_amount
-                        else:
-                            rs = float('inf')
-                        assert rs > 0
-                        resource_shares.append(rs)
-                self.task_state[t_id]['dominant_resource_share'] = max(resource_shares)
+            if self.env.config['resource_master.dp_policy.dpf_family.dominant_resource_share'] == DRS_DEFAULT:
+                for t_id in self.dp_waiting_tasks.items:
+                    # update DRS
+                    if (set(self.task_state[t_id]["resource_request"]['block_idx']) & incremented_quota_idx) or \
+                            self.task_state[t_id]['dominant_resource_share'] is None:
+                        resource_shares = []
+                        for i in self.task_state[t_id]["resource_request"]['block_idx']:
+                            quota_amount = self.env.config["resource_master.block.init_epsilon"] - \
+                                           self.block_dp_storage.items[i]['dp_container'].level
+                            if quota_amount:
+                                rs = self.task_state[t_id]["resource_request"]['epsilon'] / quota_amount
+                            else:
+                                rs = float('inf')
+                            assert rs > 0
+                            resource_shares.append(rs)
+                        self.task_state[t_id]['dominant_resource_share'] = max(resource_shares)
+
+            elif self.env.config['resource_master.dp_policy.dpf_family.dominant_resource_share'] == DRS_L2:
+                for new_task_id in new_arrival_tid:
+                    this_task = self.task_state[new_task_id]
+                    block_num = len(this_task["resource_request"]['block_idx'])
+                    # omit sqrt operation for performance, maintain the correctness/monotonicity.
+                    this_task['dominant_resource_share'] = (this_task["resource_request"]['epsilon'] ** 2) * block_num
+
+            elif self.env.config['resource_master.dp_policy.dpf_family.dominant_resource_share'] == DRS_L_INF:
+                for new_task_id in new_arrival_tid:
+                    this_task = self.task_state[new_task_id]
+                    this_task['dominant_resource_share'] = this_task["resource_request"]['epsilon']
+
+            elif self.env.config['resource_master.dp_policy.dpf_family.dominant_resource_share'] == DRS_L1:
+                for new_task_id in new_arrival_tid:
+                    this_task = self.task_state[new_task_id]
+                    block_num = len(this_task["resource_request"]['block_idx'])
+                    # omit sqrt operation for performance, maintain the correctness/monotonicity.
+                    this_task['dominant_resource_share'] = this_task["resource_request"]['epsilon'] * block_num
 
             if len(incremented_quota_idx) != 0:
                 permit_dp_task_order = sorted(self.dp_waiting_tasks.items, reverse=False,
@@ -1511,6 +1535,7 @@ if __name__ == '__main__':
         'resource_master.block.arrival_interval': 100,
         # 'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
         'resource_master.dp_policy.rate_policy.lifetime': 300,  # in sec
+        'resource_master.dp_policy.dpf_family.dominant_resource_share': DRS_DEFAULT,  # DRS_L2
 
         # 'resource_master.dp_policy': FCFS_POLICY,
         'resource_master.dp_policy': DP_POLICY_DPF,
