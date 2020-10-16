@@ -864,8 +864,10 @@ class ResourceMaster(Component):
             self.dp_sched_mail_box.put([block_id])
             yield self.global_clock.next_tick
 
-        this_block["is_retired"] = True
         assert this_block["dp_container"].level == 0
+        this_block["is_retired"] = True
+        # fake quota increment msg, to trigger waiting task exceptions
+        self.dp_sched_mail_box.put([block_id])
         self.debug('block_id %d retired with 0 DP left' % block_id)
 
     ## for rate limit policy
@@ -1560,8 +1562,8 @@ if __name__ == '__main__':
     run_test_parallel = False
 
     config = {
-        'workload_test.enabled': False,
-        'workload_test.static_blocks_num': 5,
+        'workload_test.enabled': True,
+        'workload_test.static_blocks_num': 3,
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
         'task.arrival_interval': 10,
         'task.demand.num_blocks.mu': 20,
@@ -1599,7 +1601,7 @@ if __name__ == '__main__':
         'resource_master.cpu_capacity': 96,  # number of cores
         'resource_master.memory_capacity': 624,  # in GB, assume granularity is 1GB
         'resource_master.gpu_capacity': 8,  # in cards
-        'sim.clock.tick_seconds': 5,
+        'sim.clock.tick_seconds': 1,
 
         'sim.db.enable': True,
         'sim.db.persist': True,
@@ -1709,31 +1711,30 @@ if __name__ == '__main__':
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_fcfs"
     config2["resource_master.dp_policy"] = DP_POLICY_FCFS
-
     configs.append(config2)
 
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_dpf"
     config2["resource_master.dp_policy"] = DP_POLICY_DPF
-    config2["resource_master.dp_policy.dpf.denominator"] = 17
+    config2["resource_master.dp_policy.dpf.denominator"] = 5
     configs.append(config2)
 
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_dpft"
     config2["resource_master.dp_policy"] = DP_POLICY_DPF_T
-    config2["resource_master.block.lifetime"] = 300
+    config2["resource_master.block.lifetime"] = 10
     configs.append(config2)
 
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_rate_limiting"
     config2["resource_master.dp_policy"] = DP_POLICY_RATE_LIMIT
-    config2["resource_master.block.lifetime"] = 300
+    config2["resource_master.block.lifetime"] = 10
     configs.append(config2)
 
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_dpfa"
     config2["resource_master.dp_policy"] = DP_POLICY_DPF_A
-    config2["resource_master.block.lifetime"] = 300
+    config2["resource_master.block.lifetime"] = 10
     configs.append(config2)
 
     if run_test_many:
@@ -1752,8 +1753,6 @@ if __name__ == '__main__':
             workspace_name = "workspace_%s-%s" % (sched_conf_k, task_conf_k)
             new_config["sim.workspace"] = workspace_name
             configs.append(new_config)
-    # if run_test_many:
-    #     simulate_many(configs, Top)
 
     for i, c in enumerate(configs):
         try:
