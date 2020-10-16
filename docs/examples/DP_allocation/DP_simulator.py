@@ -606,62 +606,61 @@ class ResourceMaster(Component):
             for i in resource_demand["block_idx"]:
                 self.block_dp_storage.items[i]["dp_container"].get(resource_demand["epsilon"])
 
-        elif self.is_dp_policy_dpft:
+        # appliable to other policies controlled by another (centralized) processes
+        if self.is_dp_policy_dpf or self.is_dp_policy_dpfa or self.is_dp_policy_dpft:
+            if not self.is_dp_policy_dpft:
+                # quota increment
+                this_epoch_retired_blocks = []
+                quota_increment_idx = []
+                for i in resource_demand["block_idx"]:
+                    self.block_dp_storage.items[i]["arrived_task_num"] += 1
+                    if not self.block_dp_storage.items[i]["is_retired"]:
+                        if self.is_dp_policy_dpf:
+                            quota_increment = self.env.config["resource_master.block.init_epsilon"] / self.denom
+                            assert quota_increment < self.block_dp_storage.items[i][
+                                'dp_container'].level + NUMERICAL_DELTA
+                            if -NUMERICAL_DELTA < quota_increment - self.block_dp_storage.items[i][
+                                'dp_container'].level < NUMERICAL_DELTA:
+                                get_amount = self.block_dp_storage.items[i]['dp_container'].level
+                            else:
+                                get_amount = quota_increment
+
+                            if self.block_dp_storage.items[i]["arrived_task_num"] == self.denom:
+                                self.block_dp_storage.items[i]["is_retired"] = True
+                                this_epoch_retired_blocks.append(i)
+
+                            if len(this_epoch_retired_blocks):
+                                self.debug(task_id, 'blocks get retired: ', this_epoch_retired_blocks)
+                            self.debug(task_id, "fairshare epsilon: %0.2f" % (
+                                    self.env.config['resource_master.block.init_epsilon'] / self.env.config[
+                                'resource_master.dp_policy.dpf.denominator']))
+
+                        elif self.is_dp_policy_dpfa:
+                            # last_arrival_time = self.block_dp_storage.items[i]["last_task_arrival_time"]
+                            self.block_dp_storage.items[i]["last_task_arrival_time"] = self.env.now
+                            age = self.env.now - self.block_dp_storage.items[i]["create_time"]
+                            if age < self.env.config['resource_master.block.lifetime']:
+                                target_quota = age / self.env.config['resource_master.block.lifetime'] * \
+                                               self.env.config[
+                                                   "resource_master.block.init_epsilon"]
+                                released_quota = self.env.config["resource_master.block.init_epsilon"] - \
+                                                 self.block_dp_storage.items[i]['dp_container'].level
+                                get_amount = target_quota - released_quota
+                            else:
+                                assert age == self.env.config['resource_master.block.lifetime']
+                                # let block's callback handle
+                                continue
+
+                        if get_amount > 0:
+                            self.block_dp_storage.items[i]['dp_container'].get(get_amount)
+                            self.block_dp_storage.items[i]['dp_quota'].put(get_amount)
+
+                        quota_increment_idx.append(i)
+                self.dp_sched_mail_box.put(quota_increment_idx)
+
             # dp_policy_dpft only needs enqueue
             self.dp_waiting_tasks.put(task_id)
             self.dp_sched_mail_box.put(task_id)
-
-        # appliable to other policies controlled by another (centralized) processes
-        if self.is_dp_policy_dpf or self.is_dp_policy_dpfa:
-            # quota increment
-            this_epoch_retired_blocks = []
-            quota_increment_idx = []
-            for i in resource_demand["block_idx"]:
-                self.block_dp_storage.items[i]["arrived_task_num"] += 1
-                if not self.block_dp_storage.items[i]["is_retired"]:
-                    if self.is_dp_policy_dpf:
-                        quota_increment = self.env.config["resource_master.block.init_epsilon"] / self.denom
-                        assert quota_increment < self.block_dp_storage.items[i]['dp_container'].level + NUMERICAL_DELTA
-                        if -NUMERICAL_DELTA < quota_increment - self.block_dp_storage.items[i][
-                            'dp_container'].level < NUMERICAL_DELTA:
-                            get_amount = self.block_dp_storage.items[i]['dp_container'].level
-                        else:
-                            get_amount = quota_increment
-
-                        if self.block_dp_storage.items[i]["arrived_task_num"] == self.denom:
-                            self.block_dp_storage.items[i]["is_retired"] = True
-                            this_epoch_retired_blocks.append(i)
-
-                        if len(this_epoch_retired_blocks):
-                            self.debug(task_id, 'blocks get retired: ', this_epoch_retired_blocks)
-                        self.debug(task_id, "fairshare epsilon: %0.2f" % (
-                                self.env.config['resource_master.block.init_epsilon'] / self.env.config[
-                            'resource_master.dp_policy.dpf.denominator']))
-
-                    elif self.is_dp_policy_dpfa:
-                        # last_arrival_time = self.block_dp_storage.items[i]["last_task_arrival_time"]
-                        self.block_dp_storage.items[i]["last_task_arrival_time"] = self.env.now
-                        age = self.env.now - self.block_dp_storage.items[i]["create_time"]
-                        if age < self.env.config['resource_master.block.lifetime']:
-                            target_quota = age / self.env.config['resource_master.block.lifetime'] * self.env.config[
-                                "resource_master.block.init_epsilon"]
-                            released_quota = self.env.config["resource_master.block.init_epsilon"] - \
-                                             self.block_dp_storage.items[i]['dp_container'].level
-                            get_amount = target_quota - released_quota
-                        else:
-                            assert age == self.env.config['resource_master.block.lifetime']
-                            # let block's callback handle
-                            continue
-
-                    if get_amount > 0:
-                        self.block_dp_storage.items[i]['dp_container'].get(get_amount)
-                        self.block_dp_storage.items[i]['dp_quota'].put(get_amount)
-
-                    quota_increment_idx.append(i)
-
-            self.dp_waiting_tasks.put(task_id)
-            self.dp_sched_mail_box.put(task_id)
-            self.dp_sched_mail_box.put(quota_increment_idx)
 
             unused_dp = {}
             for i, block in enumerate(self.block_dp_storage.items):
@@ -1032,10 +1031,15 @@ class ResourceMaster(Component):
                 'create_time': self.env.now,
             }
 
-            def callback_warpper(b_idx, cn, quota):
+            def eol_callback_gen(b_idx):
+                cn = self.block_dp_storage.items[b_idx]['dp_container']
+                quota = self.block_dp_storage.items[b_idx]['dp_quota']
+
                 def eol_callback(eol):
                     lvl = cn.level
                     cn.get(lvl)
+                    if quota.capacity < quota.level + lvl < quota.capacity + NUMERICAL_DELTA:
+                        lvl = quota.capacity - quota.level
                     quota.put(lvl)
                     assert cn.level == 0
                     self.dp_sched_mail_box.put([b_idx])
@@ -1055,7 +1059,7 @@ class ResourceMaster(Component):
             if self.is_dp_policy_dpfa:
                 eol_event = self.env.timeout(self.env.config['resource_master.block.lifetime'])
                 eol_event.callbacks.append(
-                    callback_warpper(self.block_dp_storage.items.index(block_item), new_block, new_quota))
+                    eol_callback_gen(self.block_dp_storage.items.index(block_item)))
 
     def _commit_dp_allocation(self, block_idx: List[int], epsilon: float):
         """
