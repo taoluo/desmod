@@ -1716,7 +1716,7 @@ if __name__ == '__main__':
     config2 = copy.deepcopy(config1)
     config2["sim.workspace"] = "workspace_dpf"
     config2["resource_master.dp_policy"] = DP_POLICY_DPF
-    config2["resource_master.dp_policy.dpf.denominator"] = 5
+    config2["resource_master.dp_policy.dpf.denominator"] = 20
     configs.append(config2)
 
     config2 = copy.deepcopy(config1)
