@@ -231,6 +231,11 @@ def simulate(
         result.setdefault('sim.runtime', timeit.default_timer() - t0)
         if result.get('sim.exception') is None:
             result['sim.exception'] = repr(e)
+    if result.get('sim.exception') is not None:
+        err_file = os.path.join(config['meta.sim.workspace'] ,'err.yaml')
+        result['config']['meta.sim.special'].append(result.get('sim.exception'))
+        _dump_dict(err_file,result['config']['meta.sim.special'])
+
     return result
 
 
@@ -272,6 +277,8 @@ def simulate_factors(
         configs[:] = filter(config_filter, configs)
     if overwrite and os.path.relpath(ws) != os.curdir and os.path.isdir(ws):
         shutil.rmtree(ws)
+    # return simulate(config=configs[71], top_type=top_type, env_type=env_type)
+    # return simulate_many([configs[103],configs[97],configs[79]], top_type, env_type, jobs)
     return simulate_many(configs, top_type, env_type, jobs)
 
 
