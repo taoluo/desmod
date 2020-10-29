@@ -1085,12 +1085,8 @@ class ResourceMaster(Component):
     def generate_datablocks_loop(self):
         cur_block_nr = 0
         block_id = count()
-        is_static_blocks = self.env.config["workload_test.enabled"] and self.env.config[
-            "workload_test.static_blocks_num"]
-        if is_static_blocks:
-            init_amount = self.env.config["workload_test.static_blocks_num"]
-        else:
-            init_amount = self.env.config["resource_master.block.init_amount"]
+        is_static_blocks = self.env.config["resource_master.block.is_static"]
+        init_amount = self.env.config["resource_master.block.init_amount"]
         while True:
             if cur_block_nr > init_amount:
                 yield self.env.timeout(self.env.config["resource_master.block.arrival_interval"])
@@ -1353,7 +1349,7 @@ class Tasks(Component):
             self.completion_time_dist = partial(self.load_rand.randint, completion_time_min,
                                                 self.env.config['task.completion_time.max'])
         choose_one = lambda *kargs, **kwargs: self.load_rand.choices(*kargs, **kwargs)[0]
-        e_mice_fraction = (100 - self.env.config['task.demand.epsilon.mice_percentage'] ) /100
+        e_mice_fraction =  self.env.config['task.demand.epsilon.mice_percentage']   /100
 
         self.epsilon_dist = partial(choose_one, (1e-3,1e-1), (e_mice_fraction, 1-e_mice_fraction) )
             # self.load_rand.uniform, 0, self.env.config['resource_master.block.init_epsilon'] / self.env.config[
@@ -1362,7 +1358,7 @@ class Tasks(Component):
 
         # num_blocks_mu = self.env.config['task.demand.num_blocks.mu']
         # num_blocks_sigma = self.env.config['task.demand.num_blocks.sigma']
-        block_mice_fraction = (100 - self.env.config['task.demand.num_blocks.mice_percentage'] ) /100
+        block_mice_fraction =  self.env.config['task.demand.num_blocks.mice_percentage']   /100
         self.num_blocks_dist = partial(choose_one, (1, 100), (block_mice_fraction, 1-block_mice_fraction ))
             # self.load_rand.normalvariate, num_blocks_mu, num_blocks_sigma
         # )
@@ -1688,17 +1684,16 @@ if __name__ == '__main__':
     run_test_single = False
     run_test_many = False
     run_test_parallel = False
-
+    run_factor = True
     config = {
         'workload_test.enabled': False,
-        'workload_test.static_blocks_num': 3,
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
         'task.arrival_interval': 10,
-        'task.demand.num_blocks.mice_percentage': 10.0,
+        'task.demand.num_blocks.mice_percentage': 100.0,
         'task.demand.num_blocks.mu': 20,
         'task.demand.num_blocks.sigma': 10,
         # num_blocks * 1/mean_tasks_per_block = 1/10
-        'task.demand.epsilon.mice_percentage': 10.0,
+        'task.demand.epsilon.mice_percentage': 50.0,
         'task.demand.epsilon.mean_tasks_per_block': 15,
 
         'task.completion_time.constant': 0, # finish immediately
@@ -1714,10 +1709,10 @@ if __name__ == '__main__':
 
         'task.demand.num_gpu.max': 3,
         'task.demand.num_gpu.min': 1,
-
         'resource_master.block.init_epsilon': 1.0,
         'resource_master.block.arrival_interval': 10,
-        'resource_master.block.init_amount': 100, # for block elephant demand
+        'resource_master.block.is_static': True,
+        'resource_master.block.init_amount': 1, # for block elephant demand
         # 'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
         'resource_master.block.lifetime': 10 * 10,  # policy level param
         'resource_master.dp_policy.dpf_family.dominant_resource_share': DRS_DEFAULT,  # DRS_L2
@@ -1762,10 +1757,14 @@ if __name__ == '__main__':
     # mice >~= half
     # 99.5 - 0.27 %
     blk_nr_mice_pct = [ (1- 2 ** (- 1.5** i )) for i in (5,4,3,2,1,0,-1,-2)]
-    epsilon_mice_pct = [ (1 - 2 ** (- 1.5** i ) )for i in (5,4,3,2,1,0,-1,-2)]
-    # [1, 2, 7, 19, 53, 143, 387, 1046] per b_genintvl
-    t_intvl =[b_genintvl * (2.7**-i) for i in (0,1,2,3,4,5,6,7)]
+    blk_nr_mice_pct = [100]
 
+    epsilon_mice_pct = [ (1 - 2 ** (- 1.5** i ) )for i in (5,4,3,2,1,0,-1,-2)]
+    epsilon_mice_pct = [ 100, 75, 50, 25 ]
+    # [1, 2, 7, 19, 53, 143, 387, 1046] per b_genintvl
+
+    t_intvl =[b_genintvl * (2.7**-i) for i in (0,1,2,3,4,5,6,7)]
+    t_intvl = [1,]
     def load_filter(conf):
         # assert stress_factor in ("blk_nr","epsilon","task_arrival" )
         blk_nr_filter = lambda c: c['task.demand.epsilon.mice_percentage']== epsilon_mice_pct[0] and c['task.arrival_interval'] == t_intvl[0]
@@ -1822,12 +1821,12 @@ if __name__ == '__main__':
     args = parser.parse_args()
     apply_user_overrides(config, args.config_overrides)
     # factors = parse_user_factors(config, args.factors)
-    if factors:
-        simulate_factors(config, factors, Top  ,config_filter=load_filter)
-    else:
-        if run_test_single:
-            pp.pprint(config)
-            simulate(copy.deepcopy(config), Top)
+    if factors and run_factor:
+        simulate_factors(config, factors, Top )# ,config_filter=load_filter)
+
+    if run_test_single:
+        pp.pprint(config)
+        simulate(copy.deepcopy(config), Top)
 
     task_configs = {}
     scheduler_configs = {}
