@@ -176,6 +176,7 @@ class Top(Component):
         tick_seconds = self.env.config['resource_master.clock.tick_seconds']
         if self.env.config['resource_master.block.lifetime'] and self.env.config['resource_master.clock.dpf_adaptive_tick']:
             tick_seconds = max(tick_seconds, self.env.config['resource_master.block.lifetime']/100)
+        # tick_seconds = 0.5
         self.global_clock = Clock(tick_seconds, self)
 
     def connect_children(self):
@@ -243,7 +244,7 @@ class ResourceMaster(Component):
 
     base_name = 'resource_master'
     _DP_HANDLER_INTERRUPT_MSG = "interrupted_by_dp_hanlder"
-    _DP_HANDLER_INTERRUPT_MSG = "interrupted_by_resource_hanlder"
+    _RSC_HANDLER_INTERRUPT_MSG = "interrupted_by_resource_hanlder"
 
     _RESRC_HANDLER_INTERRUPT_MSG = 'interrupted_by_resource_hanlder'
     _RESRC_RELEASE = "released_resource"
@@ -571,7 +572,7 @@ class ResourceMaster(Component):
                 task_demand_epsilon = this_request['epsilon']
 
                 for b_idx in task_demand_block_idx:
-                    if this_epoch_unused_quota[b_idx] < task_demand_epsilon:
+                    if this_epoch_unused_quota[b_idx] + NUMERICAL_DELTA < task_demand_epsilon :
                         are_leading_tasks_ok = False
                         break
                 # task is permitted
@@ -684,7 +685,7 @@ class ResourceMaster(Component):
         # peek remaining DP, reject if DP is already insufficient
         for i in resource_demand["block_idx"]:
             capacity = self.block_dp_storage.items[i]["dp_container"].capacity
-            if capacity < resource_demand["epsilon"]:
+            if capacity + NUMERICAL_DELTA < resource_demand["epsilon"]:
                 self.debug(task_id,
                            "DP is insufficient before asking dp scheduler, Block ID: %d, remain epsilon: %.3f" % (
                                i, capacity))
@@ -700,7 +701,8 @@ class ResourceMaster(Component):
 
         if self.is_dp_policy_fcfs:
             for i in resource_demand["block_idx"]:
-                self.block_dp_storage.items[i]["dp_container"].get(resource_demand["epsilon"])
+                # after admission control check, only need to handle numerical accuracy
+                self.block_dp_storage.items[i]["dp_container"].get(min(resource_demand["epsilon"], self.block_dp_storage.items[i]["dp_container"].level) )
 
         # appliable to other policies controlled by another (centralized) processes
         if self.is_dp_policy_dpf or self.is_dp_policy_dpfa or self.is_dp_policy_dpft:
@@ -780,7 +782,7 @@ class ResourceMaster(Component):
                 self.debug(task_id, "grant_dp_permitted after ", timedelta(seconds=(self.env.now - t0)))
                 for i in resource_demand["block_idx"]:
                     # get_evt_block_mapping[
-                    self.block_dp_storage.items[i]["dp_quota"].get(resource_demand["epsilon"])
+                    self.block_dp_storage.items[i]["dp_quota"].get(min(resource_demand["epsilon"], self.block_dp_storage.items[i]["dp_quota"].level))
 
             except DpBlockRetiredError as err:
                 self.debug(task_id, "policy=%s, fail to acquire dp: %s" % (self.dp_policy, err.__repr__()))
@@ -1197,9 +1199,9 @@ class ResourceMaster(Component):
         for i in block_idx:
             this_container = self.block_dp_storage.items[i]["dp_container"]
             this_container.capacity = max(this_container.capacity - epsilon, this_container.level)
-
-        self.unused_dp.get(epsilon * len(block_idx))
-        self.committed_dp.put(epsilon * len(block_idx))
+        committed_amount = min(epsilon * len(block_idx),self.unused_dp.level)
+        self.unused_dp.get(committed_amount)
+        self.committed_dp.put(committed_amount)
         unused_dp = []
 
         if self.is_dp_policy_dpf or self.is_dp_policy_dpft or self.is_dp_policy_dpfa:
@@ -1711,7 +1713,7 @@ if __name__ == '__main__':
         'task.demand.num_gpu.min': 1,
         'resource_master.block.init_epsilon': 1.0,
         'resource_master.block.arrival_interval': 10,
-        'resource_master.block.is_static': True,
+        'resource_master.block.is_static': False,
         'resource_master.block.init_amount': 1, # for block elephant demand
         # 'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
         'resource_master.block.lifetime': 10 * 10,  # policy level param
@@ -1756,15 +1758,17 @@ if __name__ == '__main__':
     # 2 ^ (-1.5 ^ x)
     # mice >~= half
     # 99.5 - 0.27 %
-    blk_nr_mice_pct = [ (1- 2 ** (- 1.5** i )) for i in (5,4,3,2,1,0,-1,-2)]
-    blk_nr_mice_pct = [100]
+    # blk_nr_mice_pct = [ (1- 2 ** (- 1.5** i )) for i in (5,4,3,2,1,0,-1,-2)]
+    blk_nr_mice_pct = [ 95, 75, 50, 25 ,5 ] # all block mice
 
-    epsilon_mice_pct = [ (1 - 2 ** (- 1.5** i ) )for i in (5,4,3,2,1,0,-1,-2)]
-    epsilon_mice_pct = [ 100, 75, 50, 25 ]
-    # [1, 2, 7, 19, 53, 143, 387, 1046] per b_genintvl
+    # epsilon_mice_pct = [ (1 - 2 ** (- 1.5** i ) )for i in (5,4,3,2,1,0,-1,-2)]
+    epsilon_mice_pct = [ 95, 75, 50, 25 ,5 ]
 
-    t_intvl =[b_genintvl * (2.7**-i) for i in (0,1,2,3,4,5,6,7)]
-    t_intvl = [1,]
+    # [1, 7,   53, 143, 387, 1046] per b_genintvl
+    t_intvl =[b_genintvl * (2.7**-i) for i in (0, 2, 4 ,6,7)]
+
+    # option 1
+    # t_intvl = [1,] # treat as time unit
     def load_filter(conf):
         # assert stress_factor in ("blk_nr","epsilon","task_arrival" )
         blk_nr_filter = lambda c: c['task.demand.epsilon.mice_percentage']== epsilon_mice_pct[0] and c['task.arrival_interval'] == t_intvl[0]
@@ -1775,18 +1779,34 @@ if __name__ == '__main__':
 
         # filters = {"blk_nr":blk_nr_filter, "epsilon":epsilon_filter, "task_arrival":task_arrival_filter}
         return blk_nr_filter(conf) or epsilon_filter(conf) or task_arrival_filter(conf)
+    flip_coin = random.Random(x=23425453)
+    def sparse_load_filter(conf):
+
+        # idx_sum = sum(blk_nr_mice_pct.index(conf[ 'task.demand.num_blocks.mice_percentage' ]) + epsilon_mice_pct.index(conf[ 'task.demand.epsilon.mice_percentage' ]) + t_intvl.index(conf[ 'task.arrival_interval']))
+        return flip_coin.randint(0,9) == 5
+
 
     # policy
     # 0.25 - 256
-    b_lifeintvl = [b_genintvl * (4 ** i) for i in (-1, 0, 1, 2, 3, 4 )]
+    b_lifeintvl = [b_genintvl * (4 ** i) for i in (-1, 0, 1, 2, 3, 4, 5 )]
+
+    # assume 1 sec interarrival
+    #   [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    # b_lifeintvl = [int (2 ** i) for i in (0, 1, 2, 3, 4,5,6,7,8,9,10,11,12,13)]
+
     # policy, T, N
     dpf_t_factors = zip(repeat(DP_POLICY_DPF_T), b_lifeintvl, repeat(None) )
 
-    # 1-1024
-    b_N_total = [(4 ** i) for i in (0, 1, 2, 3, 4, 5)]
+    # 1-4096
+    b_N_total = [(4 ** i) for i in (0, 1, 2, 3, 4, 5,6 )]
+
+
+    #   [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    b_N_total = [int (2 ** i) for i in (0, 1, 2, 3, 4,5,6,7,8,9,10,11,12,13)]
+
     dpf_n_factors = zip(repeat(DP_POLICY_DPF), repeat(None),  b_N_total )
 
-    factors = [
+    factors = [ (['sim.duration'], [['5000 s']]),
                 (['task.demand.num_blocks.mice_percentage'], [[i] for i in blk_nr_mice_pct]),
                (['task.demand.epsilon.mice_percentage'], [[i] for i in epsilon_mice_pct]),
                (['task.arrival_interval'], [[i] for i in t_intvl]),
@@ -1822,7 +1842,7 @@ if __name__ == '__main__':
     apply_user_overrides(config, args.config_overrides)
     # factors = parse_user_factors(config, args.factors)
     if factors and run_factor:
-        simulate_factors(config, factors, Top )# ,config_filter=load_filter)
+        simulate_factors(config, factors, Top, config_filter=sparse_load_filter)
 
     if run_test_single:
         pp.pprint(config)
