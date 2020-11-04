@@ -20,6 +20,7 @@ from functools import partial
 from itertools import count, tee, chain, repeat
 import simpy
 import sys
+import timeit
 
 if WITH_PROFILE:
     import line_profiler
@@ -58,6 +59,10 @@ from desmod.simulation import simulate, simulate_factors, simulate_many
 from collections import OrderedDict
 import pprint as pp
 import simpy as sim
+
+from desmod.simulation import (
+    SimEnvironment,
+    SimStopEvent,)
 
 ALLOCATION_SUCCESS = "V"
 ALLOCATION_FAIL = "F"
@@ -178,6 +183,13 @@ class Top(Component):
             tick_seconds = max(tick_seconds, self.env.config['resource_master.block.lifetime']/100)
         # tick_seconds = 0.5
         self.global_clock = Clock(tick_seconds, self)
+        self.add_process(self.timeout_stop)
+    
+    def timeout_stop(self):
+        t0 = timeit.default_timer()
+        while timeit.default_timer() - t0 < self.env.config['sim.runtime.timeout']*60:
+            yield self.env.timeout(20)
+        raise Exception('Simulation timeout %d min ' % self.env.config['sim.runtime.timeout'])
 
     def connect_children(self):
         self.connect(self.tasks, 'resource_master')
@@ -1736,7 +1748,8 @@ if __name__ == '__main__':
         'sim.db.persist': False,
         'sim.dot.colorscheme': 'blues5',
         'sim.dot.enable': False,
-        'sim.duration': '2000 s',
+        'sim.duration': '700 s',
+        'sim.runtime.timeout': 20, # in min
         # 'sim.duration': '10 s',
         'sim.gtkw.file': 'sim.gtkw',
         'sim.gtkw.live': False,
@@ -1783,7 +1796,7 @@ if __name__ == '__main__':
     def sparse_load_filter(conf):
 
         # idx_sum = sum(blk_nr_mice_pct.index(conf[ 'task.demand.num_blocks.mice_percentage' ]) + epsilon_mice_pct.index(conf[ 'task.demand.epsilon.mice_percentage' ]) + t_intvl.index(conf[ 'task.arrival_interval']))
-        return flip_coin.randint(0,9) == 5
+        return flip_coin.randint(0,9) in (3,6)
 
 
     # policy
@@ -1806,7 +1819,7 @@ if __name__ == '__main__':
 
     dpf_n_factors = zip(repeat(DP_POLICY_DPF), repeat(None),  b_N_total )
 
-    factors = [ (['sim.duration'], [['5000 s']]),
+    factors = [ (['sim.duration'], [['2000 s']]),
                 (['task.demand.num_blocks.mice_percentage'], [[i] for i in blk_nr_mice_pct]),
                (['task.demand.epsilon.mice_percentage'], [[i] for i in epsilon_mice_pct]),
                (['task.arrival_interval'], [[i] for i in t_intvl]),
