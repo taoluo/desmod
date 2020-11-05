@@ -1779,7 +1779,7 @@ if __name__ == '__main__':
         'sim.workspace.overwrite': True,
 
     }
-    is_single_block = True
+    is_single_block = False
 
     b_genintvl = config['resource_master.block.arrival_interval']  # 10 sec
     # load: contention from low to high
@@ -1850,22 +1850,30 @@ if __name__ == '__main__':
 
     if is_single_block:
         is_static_block = True
+        init_blocks = 1
     else:
         is_static_block = False
+        init_blocks = 100
     dpf_n_factors = zip(repeat(DP_POLICY_DPF), repeat(None), b_N_total)
     if is_single_block:
         sim_duration = round(max(b_lifeintvl) * 1.1)
     else:
         sim_duration = b_genintvl * 150  # 10 sec *
 
+    if is_single_block:
+        load_filter = lambda x: True
+    else:
+        load_filter = sparse_load_filter
+
     factors = [(['sim.duration'], [['%d s' % sim_duration]]),
                (['resource_master.block.is_static'], [[is_static_block]]),
+               (['resource_master.block.init_amount'], [[init_blocks]]),
                (['task.demand.num_blocks.mice_percentage'], [[i] for i in blk_nr_mice_pct]),
                (['task.demand.epsilon.mice_percentage'], [[i] for i in epsilon_mice_pct]),
                (['task.arrival_interval'], [[i] for i in t_intvl]),
                (['resource_master.dp_policy', 'resource_master.block.lifetime',
                  'resource_master.dp_policy.dpf.denominator'],
-                chain([[DP_POLICY_FCFS, None, None], ], dpf_t_factors, dpf_n_factors)),  #
+                list(chain([[DP_POLICY_FCFS, None, None], ], dpf_t_factors, dpf_n_factors))),  #
                ]
 
     parser = ArgumentParser()
@@ -1893,7 +1901,7 @@ if __name__ == '__main__':
     apply_user_overrides(config, args.config_overrides)
     # factors = parse_user_factors(config, args.factors)
     if factors and run_factor:
-        simulate_factors(config, factors, Top, )  # config_filter=sparse_load_filter)
+        simulate_factors(config, factors, Top, config_filter=load_filter)
 
     if run_test_single:
         pp.pprint(config)
