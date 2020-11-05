@@ -1762,26 +1762,36 @@ if __name__ == '__main__':
         'sim.vcd.dump_file': 'sim_dp.vcd',
         'sim.vcd.enable': False,
         'sim.vcd.persist': False,
-        'sim.workspace': 'workspace',
+        'sim.workspace': 'trade_off_analysis/workspace_1block',
         'sim.workspace.overwrite': True,
 
     }
+    is_single_block = True
+
     b_genintvl = config['resource_master.block.arrival_interval'] # 10 sec
     # load: contention from low to high
     # 2 ^ (-1.5 ^ x)
     # mice >~= half
-    # 99.5 - 0.27 %
-    # blk_nr_mice_pct = [ (1- 2 ** (- 1.5** i )) for i in (5,4,3,2,1,0,-1,-2)]
-    blk_nr_mice_pct = [ 95, 75, 50, 25 ,5 ] # all block mice
+
+    # option 2
+    if is_single_block:
+        blk_nr_mice_pct = [ 100 ] # all block mice
+    else:
+        # 99.5 - 0.27 %
+        # blk_nr_mice_pct = [ (1- 2 ** (- 1.5** i )) for i in (5,4,3,2,1,0,-1,-2)]
+        blk_nr_mice_pct = [95, 75, 50, 25, 5]  # all block mice
 
     # epsilon_mice_pct = [ (1 - 2 ** (- 1.5** i ) )for i in (5,4,3,2,1,0,-1,-2)]
     epsilon_mice_pct = [ 95, 75, 50, 25 ,5 ]
 
-    # [1, 7,   53, 143, 387, 1046] per b_genintvl
-    t_intvl =[b_genintvl * (2.7**-i) for i in (0, 2, 4 ,6,7)]
+    if is_single_block:
+        # option 2
+        t_intvl = [1, ]  # treat as time unit
+    else:
+        # [1, 7,   53, 143, 387, 1046] per b_genintvl
+        t_intvl =[b_genintvl * (2.7**-i) for i in (0, 2, 4 ,6,7)]
 
-    # option 1
-    # t_intvl = [1,] # treat as time unit
+
     def load_filter(conf):
         # assert stress_factor in ("blk_nr","epsilon","task_arrival" )
         blk_nr_filter = lambda c: c['task.demand.epsilon.mice_percentage']== epsilon_mice_pct[0] and c['task.arrival_interval'] == t_intvl[0]
@@ -1798,34 +1808,41 @@ if __name__ == '__main__':
         # idx_sum = sum(blk_nr_mice_pct.index(conf[ 'task.demand.num_blocks.mice_percentage' ]) + epsilon_mice_pct.index(conf[ 'task.demand.epsilon.mice_percentage' ]) + t_intvl.index(conf[ 'task.arrival_interval']))
         return flip_coin.randint(0,9) in (3,6)
 
+    if is_single_block:
+        # assume 1 sec interarrival
+        # option 2
+        #   [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+        b_lifeintvl = [int(2 ** i) for i in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)]
+    else:
+        # policy
+        # 0.25 - 256
+        b_lifeintvl = [b_genintvl * (4 ** i) for i in (-1, 0, 1, 2, 3, 4, 5 )]
 
-    # policy
-    # 0.25 - 256
-    b_lifeintvl = [b_genintvl * (4 ** i) for i in (-1, 0, 1, 2, 3, 4, 5 )]
-
-    # assume 1 sec interarrival
-    #   [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-    # b_lifeintvl = [int (2 ** i) for i in (0, 1, 2, 3, 4,5,6,7,8,9,10,11,12,13)]
 
     # policy, T, N
     dpf_t_factors = zip(repeat(DP_POLICY_DPF_T), b_lifeintvl, repeat(None) )
 
-    # 1-4096
-    b_N_total = [(4 ** i) for i in (0, 1, 2, 3, 4, 5,6 )]
 
+    if is_single_block:
+        # option 2
+        #   [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+        b_N_total = [int (2 ** i) for i in (0, 1, 2, 3, 4,5,6,7,8,9,10,11,12,13)]
+    else:
+        # 1-4096
+        b_N_total = [(4 ** i) for i in (0, 1, 2, 3, 4, 5,6 )]
 
-    #   [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-    b_N_total = [int (2 ** i) for i in (0, 1, 2, 3, 4,5,6,7,8,9,10,11,12,13)]
-
+    if is_single_block:
+        is_static_block = True
+    else:
+        is_static_block = False
     dpf_n_factors = zip(repeat(DP_POLICY_DPF), repeat(None),  b_N_total )
 
-    factors = [ (['sim.duration'], [['2000 s']]),
+    factors = [ (['sim.duration'], [['9000 s']]),
+                (['resource_master.block.is_static'], [[is_static_block]]),
                 (['task.demand.num_blocks.mice_percentage'], [[i] for i in blk_nr_mice_pct]),
                (['task.demand.epsilon.mice_percentage'], [[i] for i in epsilon_mice_pct]),
-               (['task.arrival_interval'], [[i] for i in t_intvl]),
-
+               (['task.arrival_interval'],   [[i] for i in t_intvl]),
         (['resource_master.dp_policy', 'resource_master.block.lifetime', 'resource_master.dp_policy.dpf.denominator'  ], chain( [[DP_POLICY_FCFS, None,None],], dpf_t_factors, dpf_n_factors)), #
-
     ]
 
 
@@ -1855,7 +1872,7 @@ if __name__ == '__main__':
     apply_user_overrides(config, args.config_overrides)
     # factors = parse_user_factors(config, args.factors)
     if factors and run_factor:
-        simulate_factors(config, factors, Top, config_filter=sparse_load_filter)
+        simulate_factors(config, factors, Top, )# config_filter=sparse_load_filter)
 
     if run_test_single:
         pp.pprint(config)
