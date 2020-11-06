@@ -1,0 +1,19 @@
+- - sim.duration
+  - 1500 s
+- - resource_master.block.is_static
+  - false
+- - resource_master.block.init_amount
+  - 100
+- - task.demand.num_blocks.mice_percentage
+  - 5
+- - task.demand.epsilon.mice_percentage
+  - 75
+- - task.arrival_interval
+  - 0.0095599066359748
+- - resource_master.dp_policy
+  - DPF_N_234
+- - resource_master.block.lifetime
+  - null
+- - resource_master.dp_policy.dpf.denominator
+  - 1024
+- Exception('Simulation timeout 2 min ')

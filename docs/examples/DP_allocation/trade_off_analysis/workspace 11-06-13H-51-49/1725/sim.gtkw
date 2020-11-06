@@ -1,0 +1,30 @@
+[dumpfile] "sim_dp.vcd"
+[treeopen] dp_sim.
+[signals_width] 300
+@800200
+-task
+@8024
+[color] 1
+tasks.active_count
+[color] 2
+tasks.completion_count
+[color] 3
+tasks.fail_count
+@1000200
+-task
+@800200
+-resource
+@8024
+[color] 1
+resource_master.cpu_pool
+[color] 2
+resource_master.gpu_pool
+[color] 3
+resource_master.memory_pool
+@48020
+[color] 4
+resource_master.unused_dp
+[color] 5
+resource_master.committed_dp
+@1000200
+-resource
