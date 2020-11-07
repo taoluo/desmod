@@ -182,7 +182,7 @@ class Top(Component):
         tick_seconds = self.env.config['resource_master.clock.tick_seconds']
         if self.env.config['resource_master.block.lifetime'] and self.env.config[
             'resource_master.clock.dpf_adaptive_tick']:
-            tick_seconds = max(tick_seconds, self.env.config['resource_master.block.lifetime'] / 100)
+            tick_seconds = self.env.config['resource_master.block.lifetime'] * self.env.config['task.demand.epsilon.mice'] * 0.70
         # tick_seconds = 0.5
         self.global_clock = Clock(tick_seconds, self)
         self.add_process(self.timeout_stop)
@@ -1374,7 +1374,7 @@ class Tasks(Component):
         choose_one = lambda *kargs, **kwargs: self.load_rand.choices(*kargs, **kwargs)[0]
         e_mice_fraction = self.env.config['task.demand.epsilon.mice_percentage'] / 100
 
-        self.epsilon_dist = partial(choose_one, (1e-3, 1e-1), (e_mice_fraction, 1 - e_mice_fraction))
+        self.epsilon_dist = partial(choose_one, (self.env.config['task.demand.epsilon.mice'] , self.env.config['task.demand.epsilon.elephant'] ), (e_mice_fraction, 1 - e_mice_fraction))
         # self.load_rand.uniform, 0, self.env.config['resource_master.block.init_epsilon'] / self.env.config[
         #     'task.demand.epsilon.mean_tasks_per_block'] * 2
         # )
@@ -1382,7 +1382,7 @@ class Tasks(Component):
         # num_blocks_mu = self.env.config['task.demand.num_blocks.mu']
         # num_blocks_sigma = self.env.config['task.demand.num_blocks.sigma']
         block_mice_fraction = self.env.config['task.demand.num_blocks.mice_percentage'] / 100
-        self.num_blocks_dist = partial(choose_one, (1, 100), (block_mice_fraction, 1 - block_mice_fraction))
+        self.num_blocks_dist = partial(choose_one, (self.env.config['task.demand.num_blocks.mice'] , self.env.config['task.demand.num_blocks.elephant'] ), (block_mice_fraction, 1 - block_mice_fraction))
         # self.load_rand.normalvariate, num_blocks_mu, num_blocks_sigma
         # )
 
@@ -1716,11 +1716,16 @@ if __name__ == '__main__':
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
         'task.arrival_interval': 10,
         'task.demand.num_blocks.mice_percentage': 100.0,
+        'task.demand.num_blocks.mice': 1,
+        'task.demand.num_blocks.elephant': 20,
+
         'task.demand.num_blocks.mu': 20,
         'task.demand.num_blocks.sigma': 10,
         # num_blocks * 1/mean_tasks_per_block = 1/10
         'task.demand.epsilon.mice_percentage': 50.0,
         'task.demand.epsilon.mean_tasks_per_block': 15,
+        'task.demand.epsilon.mice': 1e-2,
+        'task.demand.epsilon.elephant': 2e-1,
 
         'task.completion_time.constant': 0,  # finish immediately
         # max : half of capacity
@@ -1775,12 +1780,12 @@ if __name__ == '__main__':
         'sim.vcd.dump_file': 'sim_dp.vcd',
         'sim.vcd.enable': False,
         'sim.vcd.persist': False,
-        'sim.workspace': 'trade_off_analysis/workspace %s' % datetime.now().strftime("%m-%d-%HH-%M-%S"),
+        'sim.workspace': 'trade_off_analysis/workspace_%s' % datetime.now().strftime("%m-%d-%HH-%M-%S"),
         'sim.workspace.overwrite': True,
 
     }
     is_single_block = False
-
+    sample_val = (1,2,3,4,5, ) #6, 7,8,9,10)  # in 1 - 10
     b_genintvl = config['resource_master.block.arrival_interval']  # 10 sec
     # load: contention from low to high
     # 2 ^ (-1.5 ^ x)
@@ -1801,9 +1806,8 @@ if __name__ == '__main__':
         # option 2
         t_intvl = [1, ]  # treat as time unit
     else:
-        # [1, 7,   53, 143, 387, 1046] per b_genintvl
-        t_intvl = [b_genintvl * (2.7 ** -i) for i in (0, 2, 4, 6, 7)]
-
+        # [2, 4, 16, 64, 128, 256, 512, 1024] per b_genintvl
+        t_intvl = [b_genintvl * (2 ** -i) for i in ( 1, 2, 4, 6, 7, 8,9, 10)]
 
     def load_filter(conf):
         # assert stress_factor in ("blk_nr","epsilon","task_arrival" )
@@ -1824,7 +1828,7 @@ if __name__ == '__main__':
     def sparse_load_filter(conf):
 
         # idx_sum = sum(blk_nr_mice_pct.index(conf[ 'task.demand.num_blocks.mice_percentage' ]) + epsilon_mice_pct.index(conf[ 'task.demand.epsilon.mice_percentage' ]) + t_intvl.index(conf[ 'task.arrival_interval']))
-        return flip_coin.randint(0, 9) in (3, 6)
+        return flip_coin.randint(1, 10) in sample_val
 
 
     if is_single_block:
@@ -1834,8 +1838,8 @@ if __name__ == '__main__':
         b_lifeintvl = [int(2 ** i) for i in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)]
     else:
         # policy
-        # 0.25 - 256
-        b_lifeintvl = [b_genintvl * (4 ** i) for i in (-1, 0, 1, 2, 3, 4, 5)]
+        # [0.25, 1, 4, 16, 64, 256, // 1024]
+        b_lifeintvl = [b_genintvl * (4 ** i) for i in (-1, 0, 1, 2, 3, 4)] # 5)]
 
     # policy, T, N
     dpf_t_factors = zip(repeat(DP_POLICY_DPF_T), b_lifeintvl, repeat(None))
@@ -1845,7 +1849,7 @@ if __name__ == '__main__':
         #   [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
         b_N_total = [int(2 ** i) for i in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)]
     else:
-        # 1-4096
+        # [1, 4, 16, 64, 256, 1024, 4096]
         b_N_total = [(4 ** i) for i in (0, 1, 2, 3, 4, 5, 6)]
 
     if is_single_block:
@@ -1853,12 +1857,14 @@ if __name__ == '__main__':
         init_blocks = 1
     else:
         is_static_block = False
-        init_blocks = 100
+        init_blocks =  config['task.demand.num_blocks.elephant']
+
     dpf_n_factors = zip(repeat(DP_POLICY_DPF), repeat(None), b_N_total)
     if is_single_block:
         sim_duration = round(max(b_lifeintvl) * 1.1)
     else:
-        sim_duration = b_genintvl * 150  # 10 sec *
+        #  10 * 20 * 10 sec 
+        sim_duration = 6 * config['task.demand.num_blocks.elephant'] * b_genintvl   
 
     if is_single_block:
         load_filter = lambda x: True
