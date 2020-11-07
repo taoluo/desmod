@@ -1,0 +1,112 @@
+{
+  "config": {
+    "meta.sim.index": 582,
+    "meta.sim.special": [
+      [
+        "sim.duration",
+        "1500 s"
+      ],
+      [
+        "resource_master.block.is_static",
+        false
+      ],
+      [
+        "resource_master.block.init_amount",
+        100
+      ],
+      [
+        "task.demand.num_blocks.mice_percentage",
+        75
+      ],
+      [
+        "task.demand.epsilon.mice_percentage",
+        50
+      ],
+      [
+        "task.arrival_interval",
+        0.025811747917131964
+      ],
+      [
+        "resource_master.dp_policy",
+        "DPF_N_234"
+      ],
+      [
+        "resource_master.block.lifetime",
+        null
+      ],
+      [
+        "resource_master.dp_policy.dpf.denominator",
+        256
+      ]
+    ],
+    "meta.sim.workspace": "trade_off_analysis/workspace 11-06-13H-51-49/582",
+    "resource_master.block.arrival_interval": 10,
+    "resource_master.block.init_amount": 100,
+    "resource_master.block.init_epsilon": 1.0,
+    "resource_master.block.is_static": false,
+    "resource_master.block.lifetime": null,
+    "resource_master.clock.dpf_adaptive_tick": true,
+    "resource_master.clock.tick_seconds": 25,
+    "resource_master.cpu_capacity": 9223372036854775807,
+    "resource_master.dp_policy": "DPF_N_234",
+    "resource_master.dp_policy.dpf.denominator": 256,
+    "resource_master.dp_policy.dpf_family.dominant_resource_share": "default_def_DRS",
+    "resource_master.dp_policy.dpf_family.grant_top_small": false,
+    "resource_master.gpu_capacity": 8,
+    "resource_master.is_cpu_needed_only": true,
+    "resource_master.memory_capacity": 624,
+    "sim.config.file": null,
+    "sim.db.enable": true,
+    "sim.db.exclude_pat": [],
+    "sim.db.file": "sim.sqlite",
+    "sim.db.include_pat": [
+      ".*"
+    ],
+    "sim.db.persist": false,
+    "sim.db.trace_table": "trace",
+    "sim.dot.all.file": "all.dot",
+    "sim.dot.colorscheme": "blues5",
+    "sim.dot.conn.file": "conn.dot",
+    "sim.dot.enable": false,
+    "sim.dot.hier.file": "hier.dot",
+    "sim.duration": "1500 s",
+    "sim.gtkw.file": "sim.gtkw",
+    "sim.gtkw.live": false,
+    "sim.log.enable": false,
+    "sim.log.level": "DEBUG",
+    "sim.log.persist": true,
+    "sim.progress.enable": true,
+    "sim.progress.max_width": 0,
+    "sim.progress.update_period": "1 s",
+    "sim.result.file": "result.json",
+    "sim.runtime.timeout": 2,
+    "sim.seed": 1234,
+    "sim.timescale": "s",
+    "sim.vcd.dump_file": "sim_dp.vcd",
+    "sim.vcd.enable": false,
+    "sim.vcd.persist": false,
+    "sim.workspace": "trade_off_analysis/workspace 11-06-13H-51-49",
+    "sim.workspace.overwrite": true,
+    "task.arrival_interval": 0.025811747917131964,
+    "task.completion_time.constant": 0,
+    "task.completion_time.max": 100,
+    "task.demand.epsilon.mean_tasks_per_block": 15,
+    "task.demand.epsilon.mice_percentage": 50,
+    "task.demand.num_blocks.mice_percentage": 75,
+    "task.demand.num_blocks.mu": 20,
+    "task.demand.num_blocks.sigma": 10,
+    "task.demand.num_cpu.constant": 1,
+    "task.demand.num_cpu.max": 80,
+    "task.demand.num_cpu.min": 1,
+    "task.demand.num_gpu.max": 3,
+    "task.demand.num_gpu.min": 1,
+    "task.demand.size_memory.max": 412,
+    "task.demand.size_memory.min": 1,
+    "workload_test.enabled": false,
+    "workload_test.workload_trace_file": "/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml"
+  },
+  "sim.exception": "Exception('Simulation timeout 2 min ')",
+  "sim.now": 620,
+  "sim.runtime": 125.45349080000597,
+  "sim.time": 620
+}
