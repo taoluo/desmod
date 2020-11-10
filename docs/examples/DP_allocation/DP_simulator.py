@@ -22,6 +22,7 @@ import simpy
 import sys
 import timeit
 from datetime import datetime
+import math
 
 if WITH_PROFILE:
     import line_profiler
@@ -160,6 +161,10 @@ class DpBlockRetiredError(RuntimeError):
     pass
 
 
+class DprequestTimeoutError(RuntimeError):
+    pass
+
+
 class ResourceAllocFail(RuntimeError):
     pass
 
@@ -182,7 +187,8 @@ class Top(Component):
         tick_seconds = self.env.config['resource_master.clock.tick_seconds']
         if self.env.config['resource_master.block.lifetime'] and self.env.config[
             'resource_master.clock.dpf_adaptive_tick']:
-            tick_seconds = self.env.config['resource_master.block.lifetime'] * self.env.config['task.demand.epsilon.mice'] * 0.70
+            tick_seconds = self.env.config['resource_master.block.lifetime'] * self.env.config[
+                'task.demand.epsilon.mice'] * 0.70
         # tick_seconds = 0.5
         self.global_clock = Clock(tick_seconds, self)
         self.add_process(self.timeout_stop)
@@ -238,15 +244,15 @@ class Top(Component):
 class Clock(Component):
     base_name = 'clock'
 
-    def __init__(self, per_tick_seconds, *args, **kwargs):
+    def __init__(self, seconds_per_tick, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.tick_period = per_tick_seconds
+        self.seconds_per_tick = seconds_per_tick
         self.ticking_proc = self.env.process(self.ticking())
 
     def ticking(self):
         while True:
-            yield self.env.timeout(self.tick_period)
+            yield self.env.timeout(self.seconds_per_tick)
 
     @property
     def next_tick(self):
@@ -795,20 +801,38 @@ class ResourceMaster(Component):
                            "unused dp quota after arrival: %s (negative sign denotes demanded block)" % pp.pformat(
                                unused_dp))
 
+            def wait_for_permit():
+                yield self.task_state[task_id]["dp_permitted_event"]
+
+            wait_for_permit_proc = self.env.process(wait_for_permit())
             try:
                 t0 = self.env.now
-                yield self.task_state[task_id]["dp_permitted_event"]
-                self.debug(task_id, "grant_dp_permitted after ", timedelta(seconds=(self.env.now - t0)))
-                for i in resource_demand["block_idx"]:
-                    # get_evt_block_mapping[
-                    self.block_dp_storage.items[i]["dp_quota"].get(
-                        min(resource_demand["epsilon"], self.block_dp_storage.items[i]["dp_quota"].level))
+                permitted_or_timeout_val = yield wait_for_permit_proc | self.env.timeout(
+                    self.env.config['resource_master.block.task_timeout'], TIMEOUT_VAL)
+                if self.task_state[task_id]["dp_permitted_event"].triggered and self.task_state[task_id][
+                    "dp_permitted_event"].ok:
+                    self.debug(task_id, "grant_dp_permitted after ", timedelta(seconds=(self.env.now - t0)))
+                    for i in resource_demand["block_idx"]:
+                        # get_evt_block_mapping[
+                        self.block_dp_storage.items[i]["dp_quota"].get(
+                            min(resource_demand["epsilon"], self.block_dp_storage.items[i]["dp_quota"].level))
+                else:
+                    assert list(permitted_or_timeout_val.values())[0] == TIMEOUT_VAL
+                    raise DprequestTimeoutError()
 
-            except DpBlockRetiredError as err:
+            except (DprequestTimeoutError, DpBlockRetiredError) as err:
+                # remove from wait queue
+                if isinstance(err, DprequestTimeoutError):
+                    self.debug(task_id,
+                               "dp request timeout after %d " % self.env.config['resource_master.block.task_timeout'])
+                    idx = self.dp_waiting_tasks.items.index(task_id, 0)
+                    del self.dp_waiting_tasks.items[idx]
+
                 self.debug(task_id, "policy=%s, fail to acquire dp: %s" % (self.dp_policy, err.__repr__()))
 
-                # should not issue get to quota
-                assert not self.task_state[task_id]["dp_permitted_event"].ok
+                if isinstance(err, DpBlockRetiredError):
+                    # should not issue get to quota
+                    assert not self.task_state[task_id]["dp_permitted_event"].ok
 
                 # interrupt dp_waiting_proc
                 if this_task["handler_proc_resource"].is_alive:
@@ -969,34 +993,25 @@ class ResourceMaster(Component):
             self._retired_blocks.add(block_id)
             return
 
-        rate_per_sec = this_block["dp_container"].level / (this_block["end_of_life"] - self.env.now)
-        rate = rate_per_sec * self.global_clock.tick_period
-        is_release_done = False
-        while self.env.now < this_block["end_of_life"]:
+        total_ticks = (int((this_block["end_of_life"] - self.env.now) / self.global_clock.seconds_per_tick) + 1)
+        init_level = this_block["dp_container"].level
 
-            if self.env.now + self.global_clock.tick_period >= this_block["end_of_life"]:
-                rate_new = rate_per_sec * (this_block["end_of_life"] - self.env.now)
-                assert rate_new < this_block["dp_container"].level + NUMERICAL_DELTA
-                if -NUMERICAL_DELTA < this_block["dp_container"].level - rate_new < NUMERICAL_DELTA:
-                    get_amount = this_block["dp_container"].level
-                    is_release_done = True
-                else:
-                    get_amount = rate_new
-            else:
-                assert rate < this_block["dp_container"].level + NUMERICAL_DELTA
-                if -NUMERICAL_DELTA < this_block["dp_container"].level - rate < NUMERICAL_DELTA:
-                    get_amount = this_block["dp_container"].level
-                    is_release_done = True
-                else:
-                    get_amount = rate
+        for t in range(total_ticks):
+            should_release_amount = init_level / total_ticks * (t + 1)
+            get_amount = should_release_amount - (init_level - this_block["dp_container"].level)
+
+            if self.env.now + self.global_clock.seconds_per_tick >= this_block["end_of_life"]:
+                assert -NUMERICAL_DELTA < this_block["dp_container"].level - get_amount < NUMERICAL_DELTA
+                get_amount = this_block["dp_container"].level
 
             this_block["dp_container"].get(get_amount)
+
             assert this_block["dp_quota"].level + get_amount < this_block["dp_quota"].capacity + NUMERICAL_DELTA
             put_amount = min(get_amount, this_block["dp_quota"].capacity - this_block["dp_quota"].level)
             this_block["dp_quota"].put(put_amount)
             self.debug('block_id %d release %.3f at %.3f' % (block_id, get_amount, self.env.now))
             self.dp_sched_mail_box.put([block_id])
-            if not is_release_done:
+            if t + 1 != total_ticks:
                 yield self.global_clock.next_tick
             else:
                 break
@@ -1010,15 +1025,27 @@ class ResourceMaster(Component):
 
     ## for rate limit policy
     def scheduling_dp_subloop_rate_release(self, block_id):
-        is_active = False
-        rate = 0
+
         this_block = self.block_dp_storage.items[block_id]
+        residual_dp = 0.0
 
         # due to discretization, shift release during tick seceonds period to the start of this second.
         # therefore, last release should happen before end of life
         # wait first to sync clock
         yield self.global_clock.next_tick
-        while self.env.now < this_block["end_of_life"]:
+        total_ticks = (int((this_block["end_of_life"] - self.env.now) / self.global_clock.seconds_per_tick) + 1)
+        init_level = this_block["dp_container"].level
+
+        for t in range(total_ticks):
+            should_release_amount = init_level / total_ticks * (t + 1)
+            get_amount = should_release_amount - (init_level - this_block["dp_container"].level)
+
+            if self.env.now + self.global_clock.seconds_per_tick >= this_block["end_of_life"]:
+                assert -NUMERICAL_DELTA < this_block["dp_container"].level - get_amount < NUMERICAL_DELTA
+                get_amount = this_block["dp_container"].level
+
+            this_block["dp_container"].get(get_amount)
+            residual_dp = residual_dp + get_amount
 
             waiting_task_cn_mapping = {tid: cn for tid, cn in this_block["accum_containers"].items()
                                        if (len(cn._get_waiters) != 0 and not cn._get_waiters[0].triggered)}
@@ -1032,39 +1059,23 @@ class ResourceMaster(Component):
                 # fixme coverage
                 if this_task["resource_request"]["epsilon"] - accum_cn.level > this_block["dp_container"].capacity:
                     waiting_task_cn_mapping.pop(task_id)
-                    waiting_evt = cn._get_waiters.pop(0)
+                    waiting_evt = accum_cn._get_waiters.pop(0)
                     waiting_evt.fail(InsufficientDpException(
                         "block %d remaining uncommitted DP is insufficient for remaining ungranted dp of task %d" % (
                             block_id, task_id)))
 
             if len(waiting_task_cn_mapping) > 0:
-                # activate block/ renew rate
-                if not is_active:
-                    rate_per_sec = this_block["dp_container"].level / (this_block["end_of_life"] - self.env.now)
-                    rate = rate_per_sec * self.global_clock.tick_period
-                    is_active = True
-
-                # should return after wakeup
-                if self.env.now + self.global_clock.tick_period >= this_block["end_of_life"]:
-                    rate = rate_per_sec * (this_block["end_of_life"] - self.env.now)
-                    assert rate < this_block["dp_container"].level + NUMERICAL_DELTA
-                    if -NUMERICAL_DELTA < this_block["dp_container"].level - rate < NUMERICAL_DELTA:
-                        get_amount = this_block["dp_container"].level
-                    else:
-                        get_amount = rate
-                else:
-                    get_amount = rate
-
-                this_block["dp_container"].get(get_amount)
 
                 desired_dp = {tid: cn.capacity - cn.level for tid, cn in waiting_task_cn_mapping.items()}
                 # self.debug(block_id, "call max_min_fair_allocation")
-                fair_allocation = max_min_fair_allocation(desired=desired_dp, capacity=get_amount)
+                fair_allocation = max_min_fair_allocation(desired=desired_dp, capacity=residual_dp)
 
                 # all waiting task is granted by this block, return back unused dp
-                if sum(fair_allocation.values()) < get_amount:
-                    this_block["dp_container"].put(get_amount - sum(fair_allocation.values()))
-                    is_active = False
+                if sum(fair_allocation.values()) < residual_dp:
+                    residual_dp = residual_dp - sum(fair_allocation.values())
+
+                else:
+                    residual_dp = 0.0
 
                 for tid, dp_alloc_amount in fair_allocation.items():
                     cn = this_block["accum_containers"][tid]
@@ -1074,13 +1085,15 @@ class ResourceMaster(Component):
                         cn.put(get_amount - cn.level)
                     else:
                         cn.put(dp_alloc_amount)
-                    # finish put all
+                    # finish put alloc
                     if dp_alloc_amount == desired_dp[tid]:
                         # getter should be triggered when putter is processed
                         assert cn.level == cn._get_waiters[0].amount
+
+            if t + 1 != total_ticks:
+                yield self.global_clock.next_tick
             else:
-                is_active = False
-            yield self.global_clock.next_tick
+                break
 
         # now >= end of life
         # wait for dp getter event processed, reject untriggered get
@@ -1374,7 +1387,9 @@ class Tasks(Component):
         choose_one = lambda *kargs, **kwargs: self.load_rand.choices(*kargs, **kwargs)[0]
         e_mice_fraction = self.env.config['task.demand.epsilon.mice_percentage'] / 100
 
-        self.epsilon_dist = partial(choose_one, (self.env.config['task.demand.epsilon.mice'] , self.env.config['task.demand.epsilon.elephant'] ), (e_mice_fraction, 1 - e_mice_fraction))
+        self.epsilon_dist = partial(choose_one, (
+            self.env.config['task.demand.epsilon.mice'], self.env.config['task.demand.epsilon.elephant']),
+                                    (e_mice_fraction, 1 - e_mice_fraction))
         # self.load_rand.uniform, 0, self.env.config['resource_master.block.init_epsilon'] / self.env.config[
         #     'task.demand.epsilon.mean_tasks_per_block'] * 2
         # )
@@ -1382,7 +1397,9 @@ class Tasks(Component):
         # num_blocks_mu = self.env.config['task.demand.num_blocks.mu']
         # num_blocks_sigma = self.env.config['task.demand.num_blocks.sigma']
         block_mice_fraction = self.env.config['task.demand.num_blocks.mice_percentage'] / 100
-        self.num_blocks_dist = partial(choose_one, (self.env.config['task.demand.num_blocks.mice'] , self.env.config['task.demand.num_blocks.elephant'] ), (block_mice_fraction, 1 - block_mice_fraction))
+        self.num_blocks_dist = partial(choose_one, (
+            self.env.config['task.demand.num_blocks.mice'], self.env.config['task.demand.num_blocks.elephant']),
+                                       (block_mice_fraction, 1 - block_mice_fraction))
         # self.load_rand.normalvariate, num_blocks_mu, num_blocks_sigma
         # )
 
@@ -1542,7 +1559,7 @@ class Tasks(Component):
                 return 0
 
 
-            except (InsufficientDpException, StopReleaseDpError, DpBlockRetiredError) as err:
+            except (DprequestTimeoutError, InsufficientDpException, StopReleaseDpError, DpBlockRetiredError) as err:
                 assert not dp_committed_event.ok
                 dp_rejected_timestamp = self.resource_master.task_state[task_id]["dp_commit_timestamp"] = -self.env.now
                 allocation_rej_duration = - dp_rejected_timestamp - t0
@@ -1711,13 +1728,15 @@ if __name__ == '__main__':
     run_test_many = False
     run_test_parallel = False
     run_factor = True
+    is_single_block = False
+
     config = {
         'workload_test.enabled': False,
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
         'task.arrival_interval': 10,
         'task.demand.num_blocks.mice_percentage': 100.0,
         'task.demand.num_blocks.mice': 1,
-        'task.demand.num_blocks.elephant': 20,
+        'task.demand.num_blocks.elephant': 10,
 
         'task.demand.num_blocks.mu': 20,
         'task.demand.num_blocks.sigma': 10,
@@ -1725,7 +1744,7 @@ if __name__ == '__main__':
         'task.demand.epsilon.mice_percentage': 50.0,
         'task.demand.epsilon.mean_tasks_per_block': 15,
         'task.demand.epsilon.mice': 1e-2,
-        'task.demand.epsilon.elephant': 2e-1,
+        'task.demand.epsilon.elephant': 1e-1,
 
         'task.completion_time.constant': 0,  # finish immediately
         # max : half of capacity
@@ -1746,6 +1765,7 @@ if __name__ == '__main__':
         'resource_master.block.init_amount': 1,  # for block elephant demand
         # 'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
         'resource_master.block.lifetime': 10 * 10,  # policy level param
+        'resource_master.block.task_timeout': 100,
         'resource_master.dp_policy.dpf_family.dominant_resource_share': DRS_DEFAULT,  # DRS_L2
         'resource_master.dp_policy.dpf_family.grant_top_small': False,
         # only continous leading small tasks in queue are granted
@@ -1784,8 +1804,7 @@ if __name__ == '__main__':
         'sim.workspace.overwrite': True,
 
     }
-    is_single_block = False
-    sample_val = (1,2,3,4,5, ) #6, 7,8,9,10)  # in 1 - 10
+    sample_val = (6,)  # 2,3,4,5, ) #6, 7,8,9,10)  # in 1 - 10
     b_genintvl = config['resource_master.block.arrival_interval']  # 10 sec
     # load: contention from low to high
     # 2 ^ (-1.5 ^ x)
@@ -1807,7 +1826,8 @@ if __name__ == '__main__':
         t_intvl = [1, ]  # treat as time unit
     else:
         # [2, 4, 16, 64, 128, 256, 512, 1024] per b_genintvl
-        t_intvl = [b_genintvl * (2 ** -i) for i in ( 1, 2, 4, 6, 7, 8,9, 10)]
+        t_intvl = [b_genintvl * (2 ** -i) for i in (1, 2, 4, 6, 7, 8, 9, 10)]
+
 
     def load_filter(conf):
         # assert stress_factor in ("blk_nr","epsilon","task_arrival" )
@@ -1839,10 +1859,11 @@ if __name__ == '__main__':
     else:
         # policy
         # [0.25, 1, 4, 16, 64, 256, // 1024]
-        b_lifeintvl = [b_genintvl * (4 ** i) for i in (-1, 0, 1, 2, 3, 4)] # 5)]
+        b_lifeintvl = [b_genintvl * (4 ** i) for i in (-1, 0, 1, 2, 3, 4)]  # 5)]
 
     # policy, T, N
     dpf_t_factors = zip(repeat(DP_POLICY_DPF_T), b_lifeintvl, repeat(None))
+    rate_limit_factors = zip(repeat(DP_POLICY_RATE_LIMIT), b_lifeintvl, repeat(None))
 
     if is_single_block:
         # option 2
@@ -1857,14 +1878,14 @@ if __name__ == '__main__':
         init_blocks = 1
     else:
         is_static_block = False
-        init_blocks =  config['task.demand.num_blocks.elephant']
+        init_blocks = config['task.demand.num_blocks.elephant']
 
     dpf_n_factors = zip(repeat(DP_POLICY_DPF), repeat(None), b_N_total)
     if is_single_block:
         sim_duration = round(max(b_lifeintvl) * 1.1)
     else:
         #  10 * 20 * 10 sec 
-        sim_duration = 6 * config['task.demand.num_blocks.elephant'] * b_genintvl   
+        sim_duration = 1 * config['task.demand.num_blocks.elephant'] * b_genintvl
 
     if is_single_block:
         load_filter = lambda x: True
@@ -1879,7 +1900,7 @@ if __name__ == '__main__':
                (['task.arrival_interval'], [[i] for i in t_intvl]),
                (['resource_master.dp_policy', 'resource_master.block.lifetime',
                  'resource_master.dp_policy.dpf.denominator'],
-                list(chain([[DP_POLICY_FCFS, None, None], ], dpf_t_factors, dpf_n_factors))),  #
+                list(chain([[DP_POLICY_FCFS, None, None], ], dpf_t_factors, rate_limit_factors, dpf_n_factors))),  #
                ]
 
     parser = ArgumentParser()
