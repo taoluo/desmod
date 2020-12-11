@@ -17,7 +17,7 @@ import heapq as hq
 from argparse import ArgumentParser
 from datetime import timedelta
 from functools import partial
-from itertools import count, tee, chain, repeat
+from itertools import count, tee, chain, repeat, product
 import simpy
 import sys
 import timeit
@@ -249,14 +249,35 @@ class Clock(Component):
 
         self.seconds_per_tick = seconds_per_tick
         self.ticking_proc = self.env.process(self.ticking())
+        self.ticking_proc_h = self.env.process(self.ticking_h())
+
+    def ticking_h(self):
+        tick_counter = count()
+        while True:
+            tick_event_time = next(tick_counter) * self.seconds_per_tick
+            # high accurate tick
+            tick_event = self.env.event()
+            tick_event._value = None
+            tick_event._ok = True
+            self.env.schedule_at(event=tick_event, sim_time=tick_event_time)
+            yield tick_event
 
     def ticking(self):
+        # tick_counter = count()
         while True:
             yield self.env.timeout(self.seconds_per_tick)
 
+            # tick_event_time = next(tick_counter) * self.seconds_per_tick
+            # # high accurate tick
+            # tick_event = simpy.Event()
+            # tick_event = None
+            # tick_event._ok = True
+            # self.env.schedule_at(event=tick_event, sim_time=tick_event_time)
+            # yield tick_event
+
     @property
     def next_tick(self):
-        return self.ticking_proc.target
+        return self.ticking_proc_h.target
 
 
 class ResourceMaster(Component):
@@ -620,20 +641,22 @@ class ResourceMaster(Component):
 
                         # HACK, this is an approximation for rejection performance
                         old_demand_blk, new_demand_blk = task_demand_block_idx[0], task_demand_block_idx[-1]
-                        item = self.block_dp_storage.items[old_demand_blk]
-                        if item['is_retired']:
+                        old_item = self.block_dp_storage.items[old_demand_blk]
+                        if old_item['is_retired']:
                             if this_epoch_unused_quota[b_idx] < task_demand_epsilon:
                                 this_task["dp_permitted_event"].fail(DpBlockRetiredError())
                                 dp_rejected_task_ids.append(t_id)
                                 dp_processed_task_idx.append(idx)
+                                continue
 
                         if not self.is_dp_policy_dpft and new_demand_blk != old_demand_blk:
-                            item = self.block_dp_storage.items[new_demand_blk]
-                            if item['is_retired']:
+                            new_item = self.block_dp_storage.items[new_demand_blk]
+                            if new_item['is_retired']:
                                 if this_epoch_unused_quota[b_idx] < task_demand_epsilon:
                                     this_task["dp_permitted_event"].fail(DpBlockRetiredError())
                                     dp_rejected_task_ids.append(t_id)
                                     dp_processed_task_idx.append(idx)
+                                    continue
 
             # dequeue all permitted and rejected waiting tasks
             # HACK avoid calling get()
@@ -807,10 +830,13 @@ class ResourceMaster(Component):
             wait_for_permit_proc = self.env.process(wait_for_permit())
             try:
                 t0 = self.env.now
-                permitted_or_timeout_val = yield wait_for_permit_proc | self.env.timeout(
-                    self.env.config['resource_master.block.task_timeout'], TIMEOUT_VAL)
-                if self.task_state[task_id]["dp_permitted_event"].triggered and self.task_state[task_id][
-                    "dp_permitted_event"].ok:
+                if self.env.config['task.timeout.enabled']:
+                    permitted_or_timeout_val = yield wait_for_permit_proc | self.env.timeout(
+                        self.env.config['task.timeout.interval'], TIMEOUT_VAL)
+                else:
+                    permitted_or_timeout_val = yield wait_for_permit_proc
+
+                if wait_for_permit_proc.triggered:
                     self.debug(task_id, "grant_dp_permitted after ", timedelta(seconds=(self.env.now - t0)))
                     for i in resource_demand["block_idx"]:
                         # get_evt_block_mapping[
@@ -824,7 +850,7 @@ class ResourceMaster(Component):
                 # remove from wait queue
                 if isinstance(err, DprequestTimeoutError):
                     self.debug(task_id,
-                               "dp request timeout after %d " % self.env.config['resource_master.block.task_timeout'])
+                               "dp request timeout after %d " % self.env.config['task.timeout.interval'])
                     idx = self.dp_waiting_tasks.items.index(task_id, 0)
                     del self.dp_waiting_tasks.items[idx]
 
@@ -849,7 +875,7 @@ class ResourceMaster(Component):
                     if this_task["handler_proc_resource"].is_alive:
                         this_task["handler_proc_resource"].interrupt(self._DP_HANDLER_INTERRUPT_MSG)
                     dp_committed_event.fail(
-                        StopReleaseDpError("task %d rejected dp, due to block %d has stopped release" % (task_id, i)))
+                        StopReleaseDpError("222 task %d rejected dp, due to block %d has stopped release" % (task_id, i)))
                     return
             else:
                 for i in resource_demand["block_idx"]:
@@ -858,13 +884,29 @@ class ResourceMaster(Component):
                     this_task["accum_getters"][i] = accum_cn.get(resource_demand["epsilon"])
                     self.block_dp_storage.items[i]["accum_containers"][task_id] = accum_cn
 
-            all_getter = self.env.all_of(list(this_task["accum_getters"].values()))
+
+            def wait_for_all_getter():
+                yield self.env.all_of(list(this_task["accum_getters"].values()))
+
+            # wait_for_all_getter_proc = self.env.process(wait_for_all_getter())
+            wait_for_all_getter_proc = self.env.all_of(list(this_task["accum_getters"].values()))
 
             try:
-                yield all_getter
-                self.debug(task_id, "get all dp from blocks")
+                if self.env.config['task.timeout.enabled']:
+                    permitted_or_timeout_val = yield wait_for_all_getter_proc | self.env.timeout(
+                        self.env.config['task.timeout.interval'], TIMEOUT_VAL)
 
-            except (StopReleaseDpError, InsufficientDpException) as err:
+                else:
+                    permitted_or_timeout_val = yield wait_for_all_getter_proc
+
+                if wait_for_all_getter_proc.triggered:
+                    self.debug(task_id, "get all dp from blocks")
+
+                else:
+                    assert( TIMEOUT_VAL in list(permitted_or_timeout_val.values()))
+                    raise DprequestTimeoutError()
+
+            except (StopReleaseDpError, InsufficientDpException, DprequestTimeoutError) as err:
                 self.debug(task_id, "policy=%s, fail to acquire dp due to" % self.dp_policy, err.__repr__())
                 # interrupt dp_waiting_proc
                 if this_task["handler_proc_resource"].is_alive:
@@ -876,17 +918,24 @@ class ResourceMaster(Component):
                     get_event.defused = True
 
                     accum_container = self.block_dp_storage.items[blk_idx]['accum_containers'][task_id]
-                    dp_container = self.block_dp_storage.items[blk_idx]["dp_container"]
+                    self.block_dp_storage.items[blk_idx]['accum_containers'].pop(task_id)
+                    this_block = self.block_dp_storage.items[blk_idx]
+                    dp_container = this_block["dp_container"]
 
                     if get_event.triggered and get_event.ok:
 
                         if dp_container.level + get_event.amount < dp_container.capacity:
-                            dp_container.put(get_event.amount)
+                            # dp_container.put(get_event.amount)
+                            # fixme disable dp return
+                            # this_block['residual_dp'] = this_block['residual_dp'] +  get_event.amount
+                            pass
                         else:
                             # fill to full
                             # tolerate small numerical inaccuracy
                             assert dp_container.level + get_event.amount < dp_container.capacity + NUMERICAL_DELTA
-                            dp_container.put(dp_container.capacity - dp_container.level)
+                            # dp_container.put(dp_container.capacity - dp_container.level)
+                            # fixme disable dp return
+                            # this_block['residual_dp'] = this_block['residual_dp'] + dp_container.capacity - dp_container.level
 
                 return
 
@@ -979,7 +1028,7 @@ class ResourceMaster(Component):
         return
 
     ## for dpft policy
-    def scheduling_dp_subloop_release_quota(self, block_id):
+    def scheduling_dp_subloop_unlock_quota(self, block_id):
         self.debug('block_id %d release quota subloop start at %.3f' % (block_id, self.env.now))
         this_block = self.block_dp_storage.items[block_id]
         # wait first to sync clock
@@ -993,14 +1042,15 @@ class ResourceMaster(Component):
             self._retired_blocks.add(block_id)
             return
 
-        total_ticks = (int((this_block["end_of_life"] - self.env.now) / self.global_clock.seconds_per_tick) + 1)
+        total_ticks = (int( (this_block["end_of_life"] - self.env.now) / self.global_clock.seconds_per_tick) + 1)
         init_level = this_block["dp_container"].level
 
         for t in range(total_ticks):
             should_release_amount = init_level / total_ticks * (t + 1)
             get_amount = should_release_amount - (init_level - this_block["dp_container"].level)
 
-            if self.env.now + self.global_clock.seconds_per_tick >= this_block["end_of_life"]:
+            # if self.env.now + self.global_clock.seconds_per_tick >= this_block["end_of_life"]:
+            if t + 1 == total_ticks:
                 assert -NUMERICAL_DELTA < this_block["dp_container"].level - get_amount < NUMERICAL_DELTA
                 get_amount = this_block["dp_container"].level
 
@@ -1027,26 +1077,36 @@ class ResourceMaster(Component):
     def scheduling_dp_subloop_rate_release(self, block_id):
 
         this_block = self.block_dp_storage.items[block_id]
-        residual_dp = 0.0
+        this_block["residual_dp"] = 0.0
 
         # due to discretization, shift release during tick seceonds period to the start of this second.
         # therefore, last release should happen before end of life
         # wait first to sync clock
         yield self.global_clock.next_tick
-        total_ticks = (int((this_block["end_of_life"] - self.env.now) / self.global_clock.seconds_per_tick) + 1)
+        t0 = self.env.now
+        total_ticks = (int((this_block["end_of_life"] - t0) / self.global_clock.seconds_per_tick) + 1)
         init_level = this_block["dp_container"].level
+        ticker_counter = count()
+        # for t in range(total_ticks):
+        while True:
+            t = next(ticker_counter) + 1
+            get_amount = 0 # t + 1 > total_ticks
+            if t < total_ticks:
+                should_release_amount = init_level / total_ticks * t
+                get_amount = should_release_amount - (init_level - this_block["dp_container"].level)
 
-        for t in range(total_ticks):
-            should_release_amount = init_level / total_ticks * (t + 1)
-            get_amount = should_release_amount - (init_level - this_block["dp_container"].level)
-
-            if self.env.now + self.global_clock.seconds_per_tick >= this_block["end_of_life"]:
-                assert -NUMERICAL_DELTA < this_block["dp_container"].level - get_amount < NUMERICAL_DELTA
+            # if self.env.now + self.global_clock.seconds_per_tick >= this_block["end_of_life"]:
+            elif t == total_ticks:
+                # assert -NUMERICAL_DELTA < this_block["dp_container"].level - get_amount < NUMERICAL_DELTA
                 get_amount = this_block["dp_container"].level
 
-            this_block["dp_container"].get(get_amount)
-            residual_dp = residual_dp + get_amount
-
+            if get_amount != 0:
+                this_block["dp_container"].get(get_amount)
+                this_block["residual_dp"] = this_block["residual_dp"] + get_amount
+            else:
+                assert this_block["dp_container"].level == 0
+            get_amount_01 = get_amount
+            level_01 = this_block["dp_container"].level
             waiting_task_cn_mapping = {tid: cn for tid, cn in this_block["accum_containers"].items()
                                        if (len(cn._get_waiters) != 0 and not cn._get_waiters[0].triggered)}
 
@@ -1068,33 +1128,40 @@ class ResourceMaster(Component):
 
                 desired_dp = {tid: cn.capacity - cn.level for tid, cn in waiting_task_cn_mapping.items()}
                 # self.debug(block_id, "call max_min_fair_allocation")
-                fair_allocation = max_min_fair_allocation(desired=desired_dp, capacity=residual_dp)
+                fair_allocation = max_min_fair_allocation(desired=desired_dp, capacity=this_block["residual_dp"])
 
                 # all waiting task is granted by this block, return back unused dp
-                if sum(fair_allocation.values()) < residual_dp:
-                    residual_dp = residual_dp - sum(fair_allocation.values())
+                if sum(fair_allocation.values()) < this_block["residual_dp"]:
+                    this_block["residual_dp"] = this_block["residual_dp"] - sum(fair_allocation.values())
 
                 else:
-                    residual_dp = 0.0
+                    this_block["residual_dp"] = 0.0
+                    yield self.env.timeout(delay=0) # may update residual
 
                 for tid, dp_alloc_amount in fair_allocation.items():
                     cn = this_block["accum_containers"][tid]
                     get_amount = cn._get_waiters[0].amount
                     # fill to trigger get
-                    if dp_alloc_amount < get_amount - cn.level < dp_alloc_amount + NUMERICAL_DELTA:
+                    level_00 = cn.level
+                    if NUMERICAL_DELTA < (get_amount - cn.level) - dp_alloc_amount < NUMERICAL_DELTA:
+                        dp_alloc_amount = get_amount - cn.level
                         cn.put(get_amount - cn.level)
+                        assert dp_alloc_amount == desired_dp[tid]
+                        assert cn.level == cn._get_waiters[0].amount
                     else:
                         cn.put(dp_alloc_amount)
                     # finish put alloc
-                    if dp_alloc_amount == desired_dp[tid]:
+                    # if dp_alloc_amount == desired_dp[tid]:
                         # getter should be triggered when putter is processed
-                        assert cn.level == cn._get_waiters[0].amount
+                        # assert cn.level == cn._get_waiters[0].amount
 
-            if t + 1 != total_ticks:
-                yield self.global_clock.next_tick
-            else:
+            # if t + 1 != total_ticks and residual_dp < NUMERICAL_DELTA:
+            #     yield self.global_clock.next_tick
+
+            if this_block["residual_dp"] < NUMERICAL_DELTA and t >= total_ticks:
                 break
-
+            else:
+                yield self.global_clock.next_tick
         # now >= end of life
         # wait for dp getter event processed, reject untriggered get
         yield self.env.timeout(delay=0)
@@ -1109,7 +1176,7 @@ class ResourceMaster(Component):
                 # avoid getter triggered by cn
                 waiting_evt = cn._get_waiters.pop(0)
                 waiting_evt.fail(StopReleaseDpError(
-                    "task %d rejected dp, due to block %d has stopped release" % (task_id, block_id)))
+                    "111 task %d rejected dp, due to block %d has stopped release" % (task_id, block_id)))
         else:
             self.debug("block %d out of life, with NO waiting task" % block_id)
 
@@ -1178,6 +1245,7 @@ class ResourceMaster(Component):
                 'arrived_task_num': arrived_task_num,
                 'last_task_arrival_time': None,
                 'create_time': self.env.now,
+                'residual_dp': None,
             }
 
             def eol_callback_gen(b_idx):
@@ -1205,7 +1273,7 @@ class ResourceMaster(Component):
             if self.is_dp_policy_rate:
                 self.env.process(self.scheduling_dp_subloop_rate_release(cur_block_id))
             elif self.is_dp_policy_dpft:
-                self.env.process(self.scheduling_dp_subloop_release_quota(cur_block_id))
+                self.env.process(self.scheduling_dp_subloop_unlock_quota(cur_block_id))
             if self.is_dp_policy_dpfa:
                 eol_event = self.env.timeout(self.env.config['resource_master.block.lifetime'])
                 eol_event.callbacks.append(
@@ -1386,8 +1454,8 @@ class Tasks(Component):
                                                 self.env.config['task.completion_time.max'])
         choose_one = lambda *kargs, **kwargs: self.load_rand.choices(*kargs, **kwargs)[0]
         e_mice_fraction = self.env.config['task.demand.epsilon.mice_percentage'] / 100
-
-        self.epsilon_dist = partial(choose_one, (
+        choose_and_discount = lambda *kargs, **kwargs: choose_one(*kargs, **kwargs) * self.load_rand.uniform(0.99999, 1)
+        self.epsilon_dist = partial(choose_and_discount, (
             self.env.config['task.demand.epsilon.mice'], self.env.config['task.demand.epsilon.elephant']),
                                     (e_mice_fraction, 1 - e_mice_fraction))
         # self.load_rand.uniform, 0, self.env.config['resource_master.block.init_epsilon'] / self.env.config[
@@ -1700,25 +1768,30 @@ select avg(a)from (
             'SELECT MAX(dp_commit_timestamp - start_timestamp) as dur FROM tasks WHERE  dp_commit_timestamp >=0'
         ).fetchone()[0]
 
-        if result['succeed_tasks_total'] >= 2:
-            result['dp_allocation_duration_Median'] = self.db.execute(
+        alloc_dur = self.db.execute(
+            # "select (abs(dp_commit_timestamp) - start_timestamp) AS dp_allocation_duration  from tasks").fetchall()
+        "select dp_commit_timestamp, start_timestamp from tasks").fetchall()
+
+        result['dp_allocation_duration'] = alloc_dur # [i[0] for i in alloc_dur]
+
+        result['dp_allocation_duration_Median'] = self.db.execute(
                 sql_duration_percentile % ('dp_commit_timestamp', 2)
-            ).fetchone()[0]
+            ).fetchone()[0] if result['succeed_tasks_total'] >= 2 else None
 
-        if result['succeed_tasks_total'] >= 100:
-            result['dp_allocation_duration_P99'] = self.db.execute(
+
+        result['dp_allocation_duration_P99'] = self.db.execute(
                 sql_duration_percentile % ('dp_commit_timestamp', 100)
-            ).fetchone()[0]
+            ).fetchone()[0] if result['succeed_tasks_total'] >= 100 else None
 
-        if result['succeed_tasks_total'] >= 1000:
-            result['dp_allocation_duration_P999'] = self.db.execute(
+
+        result['dp_allocation_duration_P999'] = self.db.execute(
                 sql_duration_percentile % ('dp_commit_timestamp', 1000)
-            ).fetchone()[0]
+            ).fetchone()[0] if result['succeed_tasks_total'] >= 1000 else None
 
-        if result['succeed_tasks_total'] >= 10000:
-            result['dp_allocation_duration_P9999'] = self.db.execute(
+
+        result['dp_allocation_duration_P9999'] = self.db.execute(
                 sql_duration_percentile % ('dp_commit_timestamp', 10000)
-            ).fetchone()[0]
+            ).fetchone()[0] if result['succeed_tasks_total'] >= 10000 else None
 
 
 if __name__ == '__main__':
@@ -1734,6 +1807,9 @@ if __name__ == '__main__':
         'workload_test.enabled': False,
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
         'task.arrival_interval': 10,
+        'task.timeout.interval': 50,
+        'task.timeout.enabled': False,
+
         'task.demand.num_blocks.mice_percentage': 100.0,
         'task.demand.num_blocks.mice': 1,
         'task.demand.num_blocks.elephant': 10,
@@ -1765,8 +1841,8 @@ if __name__ == '__main__':
         'resource_master.block.init_amount': 1,  # for block elephant demand
         # 'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
         'resource_master.block.lifetime': 10 * 10,  # policy level param
-        'resource_master.block.task_timeout': 100,
-        'resource_master.dp_policy.dpf_family.dominant_resource_share': DRS_DEFAULT,  # DRS_L2
+
+        'resource_master.dp_policy.dpf_family.dominant_resource_share': DRS_L_INF,  # DRS_L2
         'resource_master.dp_policy.dpf_family.grant_top_small': False,
         # only continous leading small tasks in queue are granted
 
@@ -1783,28 +1859,28 @@ if __name__ == '__main__':
         'resource_master.clock.dpf_adaptive_tick': True,
 
         'sim.db.enable': True,
-        'sim.db.persist': False,
+        'sim.db.persist': True,
         'sim.dot.colorscheme': 'blues5',
         'sim.dot.enable': False,
         'sim.duration': '700 s',
-        'sim.runtime.timeout': 20,  # in min
+        'sim.runtime.timeout': 60,  # in min
         # 'sim.duration': '10 s',
         'sim.gtkw.file': 'sim.gtkw',
         'sim.gtkw.live': False,
-        'sim.log.enable': False,
+        'sim.log.enable': True,
         "sim.log.level": "DEBUG",
         'sim.progress.enable': True,
         'sim.result.file': 'result.json',
-        'sim.seed': 1234,
+        'sim.seed': 23338,
         'sim.timescale': 's',
         'sim.vcd.dump_file': 'sim_dp.vcd',
-        'sim.vcd.enable': False,
-        'sim.vcd.persist': False,
+        'sim.vcd.enable': True,
+        'sim.vcd.persist': True,
         'sim.workspace': 'trade_off_analysis/workspace_%s' % datetime.now().strftime("%m-%d-%HH-%M-%S"),
         'sim.workspace.overwrite': True,
 
     }
-    sample_val = (6,)  # 2,3,4,5, ) #6, 7,8,9,10)  # in 1 - 10
+    sample_val = (1, 2,3,4,5, ) #6, 7,8,9,10)  # in 1 - 10
     b_genintvl = config['resource_master.block.arrival_interval']  # 10 sec
     # load: contention from low to high
     # 2 ^ (-1.5 ^ x)
@@ -1816,25 +1892,36 @@ if __name__ == '__main__':
     else:
         # 99.5 - 0.27 %
         # blk_nr_mice_pct = [ (1- 2 ** (- 1.5** i )) for i in (5,4,3,2,1,0,-1,-2)]
-        blk_nr_mice_pct = [95, 75, 50, 25, 5]  # all block mice
+        # blk_nr_mice_pct = [100, 75, 50, 25, 0]  # all block mice
+        blk_nr_mice_pct = [ 75 ]  # all block mice
+
 
     # epsilon_mice_pct = [ (1 - 2 ** (- 1.5** i ) )for i in (5,4,3,2,1,0,-1,-2)]
-    epsilon_mice_pct = [95, 75, 50, 25, 5]
+
+    # epsilon_mice_pct = [95, 75, 50, 25, 5]
+    epsilon_mice_pct = [100, 75, 50, 25, 0]
+
+    if is_single_block:
+        epsilon_mice_pct = [100, 75, 50, 25, 0]
+    else: # ??
+        epsilon_mice_pct = [ 75]
+
 
     if is_single_block:
         # option 2
-        t_intvl = [1, ]  # treat as time unit
-    else:
-        # [2, 4, 16, 64, 128, 256, 512, 1024] per b_genintvl
-        t_intvl = [b_genintvl * (2 ** -i) for i in (1, 2, 4, 6, 7, 8, 9, 10)]
+        t_intvls = [1, ]  # treat as time unit
+    else: # ??
+        # [16, 64, 128, 256, ] per b_genintvl (10s)
+        # t_intvl = [b_genintvl * (2 ** -i) for i in ( 4, 6, 7, 8)]
+        t_intvls = [b_genintvl * (2 ** -i) for i in (6, 7,)]
 
 
     def load_filter(conf):
         # assert stress_factor in ("blk_nr","epsilon","task_arrival" )
         blk_nr_filter = lambda c: c['task.demand.epsilon.mice_percentage'] == epsilon_mice_pct[0] and c[
-            'task.arrival_interval'] == t_intvl[0]
+            'task.arrival_interval'] == t_intvls[0]
         epsilon_filter = lambda c: c['task.demand.num_blocks.mice_percentage'] == blk_nr_mice_pct[0] and c[
-            'task.arrival_interval'] == t_intvl[0]
+            'task.arrival_interval'] == t_intvls[0]
         task_arrival_filter = lambda c: c['task.demand.epsilon.mice_percentage'] == epsilon_mice_pct[0] and c[
             'task.demand.num_blocks.mice_percentage'] == blk_nr_mice_pct[0]
 
@@ -1855,23 +1942,31 @@ if __name__ == '__main__':
         # assume 1 sec interarrival
         # option 2
         #   [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-        b_lifeintvl = [int(2 ** i) for i in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)]
+        # b_lifeintvl = [int(2 ** i) for i in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)]
+        b_lifeintvl = [ 10, 50, 75, 100, 125, 150,175, 200, 225 ] # 256]
+
     else:
         # policy
         # [0.25, 1, 4, 16, 64, 256, // 1024]
-        b_lifeintvl = [b_genintvl * (4 ** i) for i in (-1, 0, 1, 2, 3, 4)]  # 5)]
+        # b_lifeintvl = [b_genintvl * (4 ** i) for i in (-1, 0, 1, 2, 3, 4)]  # 5)]
+        t_intvl_copy = t_intvls # 2**-7 * 10
+        b_lifeintvl = [b_genintvl * (2**-j)  for j in [ 1,2,3,4,5,6] ] \
+                        + [ b_genintvl*i  for i in [2,3,4,5,6,7,8,9,10,11,12,15]]
+        # b_lifeintvl = [30, 100]
 
-    # policy, T, N
-    dpf_t_factors = zip(repeat(DP_POLICY_DPF_T), b_lifeintvl, repeat(None))
-    rate_limit_factors = zip(repeat(DP_POLICY_RATE_LIMIT), b_lifeintvl, repeat(None))
-
-    if is_single_block:
+    # if is_single_block:
         # option 2
         #   [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-        b_N_total = [int(2 ** i) for i in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)]
-    else:
+        # b_N_total = [ int(i / t_intvl[0]) for i in b_lifeintvl]  # b_lifeintvl/1sec
+        # b_N_total = [ 10, 50, 75, 100, 125, 150,175, 256]
+
+    # else:
         # [1, 4, 16, 64, 256, 1024, 4096]
-        b_N_total = [(4 ** i) for i in (0, 1, 2, 3, 4, 5, 6)]
+        # fixme
+        # b_N_total = [ int(i/t_intvl_copy) for i in b_lifeintvl]
+        # b_N_total = [ 10, 50, 75, 100, 125, 150,175, 256]
+
+        # b_N_total = [(4 ** i) for i in (0, 1, 2, 3, 4, 5, 6)]
 
     if is_single_block:
         is_static_block = True
@@ -1880,27 +1975,45 @@ if __name__ == '__main__':
         is_static_block = False
         init_blocks = config['task.demand.num_blocks.elephant']
 
-    dpf_n_factors = zip(repeat(DP_POLICY_DPF), repeat(None), b_N_total)
     if is_single_block:
-        sim_duration = round(max(b_lifeintvl) * 1.1)
+        sim_duration = round(max(b_lifeintvl) * 1.05) # long enough
+        # task_timeout = [ max(i * 0.2, 3 * t_intvl[0]) for i in b_lifeintvl ]
+        task_timeout_global = 50
+        task_timeout = [ task_timeout_global  ]
     else:
         #  10 * 20 * 10 sec 
-        sim_duration = 1 * config['task.demand.num_blocks.elephant'] * b_genintvl
+        sim_duration = 10 * config['task.demand.num_blocks.elephant'] * b_genintvl
+        task_timeout_global = 50
+        task_timeout =  [ task_timeout_global  ]
 
+
+    # policy, T, N
+    dpf_t_factors = product(t_intvls, [DP_POLICY_DPF_T], b_lifeintvl, [None], [task_timeout_global])
+    rate_limit_factors = product(t_intvls, [DP_POLICY_RATE_LIMIT], b_lifeintvl, [None], [task_timeout_global])
+        # zip(repeat(DP_POLICY_RATE_LIMIT), b_lifeintvl, repeat(None)) , task_timeout)
+    dpf_n_factors = product(t_intvls, [DP_POLICY_DPF], b_lifeintvl, [None], [task_timeout_global])
+    dpf_n_factors = filter(lambda x: x[3] > 0, map(lambda x: (x[0],x[1],x[2],int(x[2]/x[0]),x[4]) ,  dpf_n_factors))
+    # for i in dpf_n_factors:
+    #     if i[3] <= 0:
+    #         print(i)
     if is_single_block:
         load_filter = lambda x: True
     else:
         load_filter = sparse_load_filter
+        load_filter = lambda x: True
 
     factors = [(['sim.duration'], [['%d s' % sim_duration]]),
                (['resource_master.block.is_static'], [[is_static_block]]),
                (['resource_master.block.init_amount'], [[init_blocks]]),
                (['task.demand.num_blocks.mice_percentage'], [[i] for i in blk_nr_mice_pct]),
                (['task.demand.epsilon.mice_percentage'], [[i] for i in epsilon_mice_pct]),
-               (['task.arrival_interval'], [[i] for i in t_intvl]),
-               (['resource_master.dp_policy', 'resource_master.block.lifetime',
-                 'resource_master.dp_policy.dpf.denominator'],
-                list(chain([[DP_POLICY_FCFS, None, None], ], dpf_t_factors, rate_limit_factors, dpf_n_factors))),  #
+               # (['task.arrival_interval'], [[i] for i in t_intvl]),
+               (['task.arrival_interval','resource_master.dp_policy', 'resource_master.block.lifetime',
+                 'resource_master.dp_policy.dpf.denominator','task.timeout.interval'],
+                list(chain(product(t_intvls, [DP_POLICY_FCFS], [0.0], [0.0], [task_timeout_global] ),
+                           dpf_n_factors,
+                           dpf_t_factors,
+                           rate_limit_factors))),  # rate_limit_factors, dpf_t_factors, dpf_n_factors,
                ]
 
     parser = ArgumentParser()
