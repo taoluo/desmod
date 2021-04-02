@@ -277,8 +277,11 @@ def simulate_factors(
         configs[:] = filter(config_filter, configs)
     if overwrite and os.path.relpath(ws) != os.curdir and os.path.isdir(ws):
         shutil.rmtree(ws)
-    # return simulate(config=configs[71], top_type=top_type, env_type=env_type)
-    # return simulate_many([configs[103],configs[97],configs[79]], top_type, env_type, jobs)
+    for c in configs:
+        if c['meta.sim.index'] == 0:
+            # return simulate(config=c, top_type=top_type, env_type=env_type)
+            pass
+    # return simulate_many([configs[96],configs[97],configs[79]], top_type, env_type, jobs)
     return simulate_many(configs, top_type, env_type, jobs)
 
 
