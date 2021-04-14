@@ -670,32 +670,32 @@ class ResourceMaster(Component):
                 new_demand_b_idx = task_demand_block_idx[-1]
                 if old_item["retire_event"].triggered and old_item["retire_event"].ok:
                     b = old_demand_b_idx
-                    if not self.is_rdp:
-                        if this_epoch_unused_quota[b] < task_demand_epsilon:
-                            should_reject = True
-                    else:
-                        for j, e_rdp in enumerate(task_demand_e_rdp):
-                            if e_rdp <= self.block_dp_storage.items[b]['rdp_budget_curve'][j] - \
-                                    self.block_dp_storage.items[b]["rdp_consumption"][j]:
-                                break
-                        else:
-                            should_reject = True
-                ## ???? reject condition why not dpft???
+                    # if not self.is_rdp:
+                    if this_epoch_unused_quota[b] < task_demand_epsilon:
+                        should_reject = True
+                    # else:
+                    #     for j, e_rdp in enumerate(task_demand_e_rdp):
+                    #         if e_rdp <= self.block_dp_storage.items[b]['rdp_budget_curve'][j] - \
+                    #                 self.block_dp_storage.items[b]["rdp_consumption"][j]:
+                    #             break
+                    #     else:
+                    #         should_reject = True
+                ##  why not is_dpft: for dpft unnecessary to check
                 elif not self.is_dp_policy_dpft and new_demand_b_idx != old_demand_b_idx:
                     new_item = self.block_dp_storage.items[new_demand_b_idx]
                     if new_item["retire_event"] and new_item["retire_event"].triggered:
                         ## copied from above, same standard of rejection
                         b = new_demand_b_idx
-                        if not self.is_rdp:
-                            if this_epoch_unused_quota[b] < task_demand_epsilon:
-                                should_reject = True
-                        else:
-                            for j, e_rdp in enumerate(task_demand_e_rdp):
-                                if e_rdp <= self.block_dp_storage.items[b]['rdp_budget_curve'][j] - \
-                                        self.block_dp_storage.items[b]["rdp_consumption"][j]:
-                                    break
-                            else:
-                                should_reject = True
+                        # if not self.is_rdp:
+                        if this_epoch_unused_quota[b] < task_demand_epsilon:
+                            should_reject = True
+                        # else:
+                        #     for j, e_rdp in enumerate(task_demand_e_rdp):
+                        #         if e_rdp <= self.block_dp_storage.items[b]['rdp_budget_curve'][j] - \
+                        #                 self.block_dp_storage.items[b]["rdp_consumption"][j]:
+                        #             break
+                        #     else:
+                        #         should_reject = True
 
                 if should_reject:
                     this_task["dp_permitted_event"].fail(DpBlockRetiredError())
@@ -768,7 +768,7 @@ class ResourceMaster(Component):
                 assert is_quota_insufficient_all or is_quota_insufficient_any
                 if self.block_dp_storage.items[b]["retire_event"].triggered and self.block_dp_storage.items[b]["retire_event"].ok:
                     dp_rejected_task_ids.add(t_id)
-                    this_task["dp_permitted_event"].fail(DpBlockRetiredError())
+                    this_task["dp_permitted_event"].fail(DpBlockRetiredError("block %d retired, insufficient unlocked rdp left" % b))
                     # this_task["dp_committed_event"].fail(DpBlockRetiredError()) #???? delay to handling permission
                     this_task['is_dp_granted'] = False
 
@@ -1331,11 +1331,13 @@ class ResourceMaster(Component):
 
         except (DprequestTimeoutError, DpBlockRetiredError) as err:
             # remove from wait queue
+            # idx = self.dp_waiting_tasks.items.index(task_id, 0)
+            # del self.dp_waiting_tasks.items[idx]
+# ???
             if isinstance(err, DprequestTimeoutError):
                 self.debug(task_id,
                            "dp request timeout after %d " % self.env.config['task.timeout.interval'])
-                idx = self.dp_waiting_tasks.items.index(task_id, 0)
-                del self.dp_waiting_tasks.items[idx]
+
 
             self.debug(task_id, "policy=%s, fail to acquire dp: %s" % (self.dp_policy, err.__repr__()))
 
@@ -1612,7 +1614,8 @@ class ResourceMaster(Component):
             new_tid = yield this_block['_mail_box'].get()
             n = this_block['arrived_task_num'] # should update in task hander
             if n == self.denom:
-                this_block["retire_event"].succeed()
+                # already retired by task handler
+                assert this_block["retire_event"].ok
             elif n > self.denom and this_block["residual_dp"] < NUMERICAL_DELTA:
                 break
 
@@ -2480,14 +2483,14 @@ select avg(a)from (
 if __name__ == '__main__':
     import copy
 
-    run_test_single = False
+    run_test_single = True
     run_test_many = False
     run_test_parallel = False
     run_factor = False
     is_factor_single_block = True
     is_factor_rdp = True
 
-    run_test_by_factor = True
+    run_test_by_factor = False
     config = {
         'workload_test.enabled': False,
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
@@ -2495,7 +2498,7 @@ if __name__ == '__main__':
         'task.timeout.interval': 50,
         'task.timeout.enabled': True,
 
-        'task.demand.num_blocks.mice_percentage': 100.0,
+
         'task.demand.num_blocks.mice': 1,
         'task.demand.num_blocks.elephant': 10,
 
@@ -2522,16 +2525,14 @@ if __name__ == '__main__':
         'task.demand.num_gpu.min': 1,
         'resource_master.block.init_epsilon': 1.0, # normalized
         'resource_master.block.init_delta': 1.0e-6,  #  only used for rdp should be small < 1
-        'resource_master.dp_policy.is_rdp': True,
+
         'resource_master.dp_policy.is_rdp.mechanism': GAUSSIAN,
         'resource_master.dp_policy.is_rdp.rdp_bound_mode': PARTIAL_BOUNDED_RDP, # PARTIAL_BOUNDED_RDP
         'resource_master.dp_policy.is_rdp.dominant_resource_share': DRS_RDP_alpha_all,
 
         'resource_master.block.arrival_interval': 10,
-        'resource_master.block.is_static': True,
-        'resource_master.block.init_amount': 10,  # for block elephant demand
+
         # 'resource_master.dp_policy': DP_POLICY_RATE_LIMIT,
-        'resource_master.block.lifetime': 100 * 10,  # policy level param
 
         # 'resource_master.dp_policy.dpf_family.dominant_resource_share': DRS_L_INF,  # DRS_L2
         'resource_master.dp_policy.dpf_family.dominant_resource_share':  DRS_DP_L_Inf,  # DRS_L2
@@ -2543,8 +2544,16 @@ if __name__ == '__main__':
         # DP_POLICY_DPF_N DP_POLICY_DPF_T  DP_POLICY_DPF_NA
         # todo fcfs rdp
         # 'resource_master.dp_policy': DP_POLICY_FCFS,
+        # policy
+        'resource_master.dp_policy.is_rdp': True,
         'resource_master.dp_policy': DP_POLICY_DPF_T,
         'resource_master.dp_policy.denominator': 100,
+        'resource_master.block.lifetime': 100 * 10,  # policy level param
+        # workload
+        'resource_master.block.is_static': True,
+        'resource_master.block.init_amount': 1,  # for block elephant demand
+        'task.demand.num_blocks.mice_percentage': 100.0,
+
         # https://cloud.google.com/compute/docs/gpus
         # V100 VM instance
         'resource_master.is_cpu_needed_only': True,
@@ -2732,7 +2741,7 @@ if __name__ == '__main__':
     N_rdp = 14514
     T_rdp = 10 * 14514
 
-    test_factors = [(['sim.duration'], [['%d s' % 250000 ]]),
+    test_factors = [(['sim.duration'], [['%d s' % 30000 ]]), # 250000
                     (['resource_master.block.is_static', 'resource_master.block.init_amount', 'task.demand.num_blocks.mice_percentage'],
                      [[True, 1,100], # single block
                       [False, 10, 75]],  # dynamic block
