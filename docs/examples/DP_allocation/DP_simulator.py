@@ -760,7 +760,7 @@ class ResourceMaster(Component):
                 permitted_blk_ids.update(task_demand_block_idx)
                 dp_processed_task_idx.append(idx)
                 # need to update consumption for following rejection
-                # fixme use copy of consumption curive for accounting and reject !!!!!!
+                # fixme use copy of consumption curve for accounting and reject !!!!!!
                 self._commit_rdp_allocation(task_demand_block_idx, task_demand_e_rdp)
                 this_task["dp_committed_event"].succeed()
                 this_task['is_dp_granted'] = True
@@ -1349,9 +1349,14 @@ class ResourceMaster(Component):
             if this_task["handler_proc_resource"].is_alive:
                 this_task["handler_proc_resource"].interrupt(self._DP_HANDLER_INTERRUPT_MSG)
             # if not self.is_rdp:
+            del_idx = self.dp_waiting_tasks.items.index(task_id)
+            del self.dp_waiting_tasks.items[del_idx]
+
             dp_committed_event.fail(err)
             # else:
             #     assert dp_committed_event.triggered
+
+
             return 1
 
     def task_dp_handler(self, task_id):
@@ -2741,7 +2746,7 @@ if __name__ == '__main__':
     N_rdp = 14514
     T_rdp = 10 * 14514
 
-    test_factors = [(['sim.duration'], [['%d s' % 30000 ]]), # 250000
+    test_factors = [(['sim.duration'], [['%d s' % 10000 ]]), # 250000
                     (['resource_master.block.is_static', 'resource_master.block.init_amount', 'task.demand.num_blocks.mice_percentage'],
                      [[True, 1,100], # single block
                       [False, 10, 75]],  # dynamic block
