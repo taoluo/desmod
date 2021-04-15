@@ -1335,6 +1335,8 @@ class ResourceMaster(Component):
             # del self.dp_waiting_tasks.items[idx]
 # ???
             if isinstance(err, DprequestTimeoutError):
+                del_idx = self.dp_waiting_tasks.items.index(task_id)
+                del self.dp_waiting_tasks.items[del_idx]
                 self.debug(task_id,
                            "dp request timeout after %d " % self.env.config['task.timeout.interval'])
 
@@ -1349,8 +1351,7 @@ class ResourceMaster(Component):
             if this_task["handler_proc_resource"].is_alive:
                 this_task["handler_proc_resource"].interrupt(self._DP_HANDLER_INTERRUPT_MSG)
             # if not self.is_rdp:
-            del_idx = self.dp_waiting_tasks.items.index(task_id)
-            del self.dp_waiting_tasks.items[del_idx]
+
 
             dp_committed_event.fail(err)
             # else:
@@ -2488,14 +2489,14 @@ select avg(a)from (
 if __name__ == '__main__':
     import copy
 
-    run_test_single = True
+    run_test_single = False
     run_test_many = False
     run_test_parallel = False
     run_factor = False
     is_factor_single_block = True
     is_factor_rdp = True
 
-    run_test_by_factor = False
+    run_test_by_factor = True
     config = {
         'workload_test.enabled': False,
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
