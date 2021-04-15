@@ -312,7 +312,7 @@ class ResourceMaster(Component):
         self.is_dp_policy_rr_nn = self.dp_policy == DP_POLICY_RR_NN
 
         self.is_centralized_quota_sched = self.is_dp_policy_dpfn or self.is_dp_policy_dpfna or self.is_dp_policy_dpft
-        self.is_decentralized_container_sched = self.is_dp_policy_rr_t or self.is_dp_policy_rr_n or self.is_dp_policy_rr_nn
+        self.is_accum_container_sched = self.is_dp_policy_rr_t or self.is_dp_policy_rr_n or self.is_dp_policy_rr_nn
         self.is_N_based_retire = self.is_dp_policy_rr_nn or self.is_dp_policy_rr_n or self.is_dp_policy_dpfn
         self.is_T_based_retire = self.is_dp_policy_rr_t or self.is_dp_policy_dpft or self.is_dp_policy_dpfna
         # regardless of rdp or dp
@@ -668,7 +668,8 @@ class ResourceMaster(Component):
                 old_demand_b_idx = task_demand_block_idx[0]
                 old_item = self.block_dp_storage.items[old_demand_b_idx]
                 new_demand_b_idx = task_demand_block_idx[-1]
-                if old_item["retire_event"].triggered and old_item["retire_event"].ok:
+                if old_item["retire_event"].triggered:
+                    assert old_item["retire_event"].ok
                     b = old_demand_b_idx
                     # if not self.is_rdp:
                     if this_epoch_unused_quota[b] < task_demand_epsilon:
@@ -760,13 +761,14 @@ class ResourceMaster(Component):
                 permitted_blk_ids.update(task_demand_block_idx)
                 dp_processed_task_idx.append(idx)
                 # need to update consumption for following rejection
-                # fixme use copy of consumption curve for accounting and reject !!!!!!
+                # fixme use copy of consumption curve for accounting and reject !!!!
                 self._commit_rdp_allocation(task_demand_block_idx, task_demand_e_rdp)
                 this_task["dp_committed_event"].succeed()
                 this_task['is_dp_granted'] = True
             else:
                 assert is_quota_insufficient_all or is_quota_insufficient_any
-                if self.block_dp_storage.items[b]["retire_event"].triggered and self.block_dp_storage.items[b]["retire_event"].ok:
+                if self.block_dp_storage.items[b]["retire_event"].triggered:
+                    assert self.block_dp_storage.items[b]["retire_event"].ok
                     dp_rejected_task_ids.add(t_id)
                     this_task["dp_permitted_event"].fail(DpBlockRetiredError("block %d retired, insufficient unlocked rdp left" % b))
                     # this_task["dp_committed_event"].fail(DpBlockRetiredError()) #???? delay to handling permission
@@ -1090,7 +1092,7 @@ class ResourceMaster(Component):
     #         dp_committed_event.fail(err)
     #         return
 
-    def _task_admission_control_ok(self, task_id):
+    def _check_task_admission_control(self, task_id):
 
         this_task = self.task_state[task_id]
         resource_demand = this_task["resource_request"]
@@ -1099,7 +1101,8 @@ class ResourceMaster(Component):
             # only check uncommitted dp capacity
             # peek remaining DP, reject if DP is already insufficient
             for i in resource_demand["block_idx"]:
-                capacity = self.block_dp_storage.items[i]["dp_container"].capacity
+                this_block = self.block_dp_storage.items[i]
+                capacity = this_block["dp_container"].capacity
                 if capacity + NUMERICAL_DELTA < resource_demand["epsilon"]:
                     self.debug(task_id,
                                "DP is insufficient before asking dp scheduler, Block ID: %d, remain epsilon: %.3f" % (
@@ -1110,6 +1113,8 @@ class ResourceMaster(Component):
                     dp_committed_event.fail(InsufficientDpException(
                         "DP request is rejected by handler admission control, Block ID: %d, remain epsilon: %.3f" % (
                             i, capacity)))
+                    return False
+                elif self.is_accum_container_sched and (not this_block['block_proc'].is_alive):
                     return False
         else:
             for b in resource_demand["block_idx"]:
@@ -1122,6 +1127,7 @@ class ResourceMaster(Component):
                     if this_task["handler_proc_resource"].is_alive:
                         this_task["handler_proc_resource"].interrupt(self._DP_HANDLER_INTERRUPT_MSG)
                     # inform user's dp waiting task
+                    this_task['is_dp_granted'] = False
                     dp_committed_event.fail(InsufficientDpException(
                         "RDP request is rejected by handler admission control, Block ID: %d " % (
                             b)))
@@ -1151,32 +1157,34 @@ class ResourceMaster(Component):
             # quota increment
         quota_increment_idx = []
         retired_blocks_before_arrival= []
+        inactive_block_sched_procs = []
         for i in resource_demand["block_idx"]:
             this_block = self.block_dp_storage.items[i]
 
             this_block["arrived_task_num"] += 1
 
-            if self.is_N_based_retire and (this_block["arrived_task_num"] > self.denom):
+            if this_block["retire_event"].triggered:
+                assert this_block["retire_event"].ok
                 retired_blocks_before_arrival.append(i)
-                continue
-            elif self.is_T_based_retire and self.env.now - this_block["create_time"] > self.env.config['resource_master.block.lifetime']:
-                retired_blocks_before_arrival.append(i)
-                continue
+                if self.does_task_handler_unlock_quota:
+                    continue
+                # continue
+            # elif self.is_T_based_retire and self.env.now - this_block["create_time"] > self.env.config['resource_master.block.lifetime']:
+            #     retired_blocks_before_arrival.append(i)
+            #     continue
             # retire block by task
-            if self.is_N_based_retire and (this_block["arrived_task_num"] == self.denom):
-                this_block["retire_event"].succeed()
-                self._retired_blocks.add(i)
-                blocks_retired_by_this_task.append(i)
+
 
             # unlock quota by task
-            if self.does_task_handler_unlock_quota:
+            elif self.does_task_handler_unlock_quota:
                 new_quota_unlocked = None
 
             # update quota
             if not self.is_rdp:
                 # if self.is_centralized_quota_sched:
                 if self.is_dp_policy_dpfn:
-                    if this_block["arrived_task_num"] <= self.denom:
+                    if not this_block["retire_event"].triggered:
+                        # assert this_block["retire_event"].ok
                         quota_increment = self.env.config["resource_master.block.init_epsilon"] / self.denom
                         assert quota_increment < this_block[
                             'dp_container'].level + NUMERICAL_DELTA
@@ -1190,11 +1198,14 @@ class ResourceMaster(Component):
                         new_quota_unlocked = True
                     else: raise Exception('canot happen')
 
-
+                elif self.is_dp_policy_dpft:
+                    pass
                 elif self.is_dp_policy_dpfna:
                     # last_arrival_time = this_block["last_task_arrival_time"]
-                    age = self.env.now - this_block["create_time"]
-                    if age < self.env.config['resource_master.block.lifetime']:
+
+                    if not this_block["retire_event"].triggered:
+
+                        age = self.env.now - this_block["create_time"]
                         target_quota1 = age / self.env.config['resource_master.block.lifetime'] * \
                                         self.env.config[
                                             "resource_master.block.init_epsilon"]
@@ -1209,10 +1220,11 @@ class ResourceMaster(Component):
                         this_block['dp_quota'].put(get_amount)
                         new_quota_unlocked = True
                     else:
+                        # assert this_block["retire_event"].ok
                         raise Exception('fweaew')
 
                 elif self.is_dp_policy_rr_n:
-                    if this_block["arrived_task_num"] <= self.denom: #  sched  finished wont be allocated
+                    if not this_block["retire_event"].triggered: #  sched  finished wont be allocated
                         # centralized update;
                         # elif self.is_dp_policy_rr_n:
                         quota_increment = self.env.config["resource_master.block.init_epsilon"] / self.denom
@@ -1229,21 +1241,32 @@ class ResourceMaster(Component):
                         this_block["residual_dp"] = this_block["global_epsilon_dp"] * this_block[
                             "arrived_task_num"] / self.denom
                         new_quota_unlocked = True
-                    else: raise Exception('fweaew')
+                    elif not this_block['block_proc'].is_alive:
+                        inactive_block_sched_procs.append(i)
+                        continue
+                    else:
+                        raise Exception('fweaew')
                     # interrupt dp_waiting_proc
                         # retired_blocks_before_arrival.append(i)
 
 
                 elif self.is_dp_policy_rr_t:
-                    pass
+                    if not this_block['block_proc'].is_alive:
+                        inactive_block_sched_procs.append(i)
+                        continue
                 elif self.is_dp_policy_rr_nn:
-                    this_block['_mail_box'].put(task_id)
-
+                    if this_block['block_proc'].is_alive:
+                        this_block['_mail_box'].put(task_id)
+                    else:
+                        inactive_block_sched_procs.append(i)
+                        continue
+                else:
+                    raise NotImplementedError()
 
             else:
                 assert self.is_rdp
                 if self.is_dp_policy_dpfn:
-                    if this_block["arrived_task_num"] <= self.denom:
+                    if not this_block["retire_event"].triggered:
                         fraction = this_block["arrived_task_num"] / self.denom
                         if fraction < 1:
                             this_block['rdp_quota_curve'] = [bjt * fraction for bjt in
@@ -1255,19 +1278,24 @@ class ResourceMaster(Component):
                         new_quota_unlocked = True
                     else:
                         raise Exception('fweaew')
-                elif self.is_dp_policy_dpft:
 
+                elif self.is_dp_policy_dpft:
                     pass
+
                 else:
                     raise NotImplementedError()
 
             if self.does_task_handler_unlock_quota and new_quota_unlocked:
                 quota_increment_idx.append(i)
 
+            if self.is_N_based_retire and (this_block["arrived_task_num"] == self.denom):
+                this_block["retire_event"].succeed()
+                self._retired_blocks.add(i)
+                blocks_retired_by_this_task.append(i)
 
         # for RR policy, add accum container and getter per task
-        if self.is_dp_policy_rr_t or self.is_dp_policy_rr_n or self.is_dp_policy_rr_nn:
-            if len(retired_blocks_before_arrival) == 0: # make sure no retired blocks before
+        if self.is_accum_container_sched:
+            if len(inactive_block_sched_procs) == 0: # make sure no retired blocks before
                 if not self.is_rdp:
                     for i in resource_demand["block_idx"]:
                         # need to wait to get per-task accum containers
@@ -1333,7 +1361,6 @@ class ResourceMaster(Component):
             # remove from wait queue
             # idx = self.dp_waiting_tasks.items.index(task_id, 0)
             # del self.dp_waiting_tasks.items[idx]
-# ???
             if isinstance(err, DprequestTimeoutError):
                 del_idx = self.dp_waiting_tasks.items.index(task_id)
                 del self.dp_waiting_tasks.items[del_idx]
@@ -1367,7 +1394,7 @@ class ResourceMaster(Component):
 
         resource_demand = this_task["resource_request"]
         # admission control
-        if not self._task_admission_control_ok(task_id):
+        if not self._check_task_admission_control(task_id):
             return
         # getevent -> blk_idx
 
@@ -1490,8 +1517,8 @@ class ResourceMaster(Component):
 
         return
 
-    ## for dpft policy
-    def _dpft_subloop_unlock_quota_n_sched(self, block_id):
+    ##  unlock dp quota for dpft policy
+    def _dpft_subloop_unlock_quota(self, block_id):
         self.debug('block_id %d release quota subloop start at %.3f' % (block_id, self.env.now))
         this_block = self.block_dp_storage.items[block_id]
         # wait first to sync clock
@@ -1893,7 +1920,7 @@ class ResourceMaster(Component):
             # no sched fcfs
             accum_cn_dict = None
             new_quota = None
-            if self.is_decentralized_container_sched:
+            if self.is_accum_container_sched:
                 accum_cn_dict = dict()
                 new_quota = None
             elif self.is_centralized_quota_sched:
@@ -1918,6 +1945,7 @@ class ResourceMaster(Component):
                 'last_task_arrival_time': None,
                 'create_time': self.env.now,
                 'residual_dp': 0.0,
+                'block_proc': None,
                 '_mail_box': DummyPutQueue(self.env,capacity=1, hard_cap=True)
             }
 
@@ -1929,28 +1957,28 @@ class ResourceMaster(Component):
 
             if self.is_dp_policy_rr_t:
                 if not self.is_rdp:
-                    self.env.process(self._rr_t_subloop_unlock_quota_n_sched(cur_block_id))
+                    block_item['block_proc'] = self.env.process(self._rr_t_subloop_unlock_quota_n_sched(cur_block_id))
                 else: raise NotImplementedError()
 
             elif self.is_dp_policy_rr_n:
                 if not self.is_rdp:
-                    self.env.process(self._rr_n_subloop_eol_sched(cur_block_id))
+                    block_item['block_proc'] = self.env.process(self._rr_n_subloop_eol_sched(cur_block_id))
                 else:
                     raise NotImplementedError()
 
             elif self.is_dp_policy_dpft:
                 # if not self.is_rdp:
                 # one process for rdp and non-rdp
-                self.env.process(self._dpft_subloop_unlock_quota_n_sched(cur_block_id))
+                block_item['block_proc'] =  self.env.process(self._dpft_subloop_unlock_quota(cur_block_id))
                 # else:
                 #     raise NotImplementedError()
 
             elif self.is_dp_policy_dpfna:
-                eol_event = self.env.timeout(self.env.config['resource_master.block.lifetime'])
-                eol_event.callbacks.append(
+                block_item['retire_event'] = self.env.timeout(self.env.config['resource_master.block.lifetime'])
+                block_item['retire_event'].callbacks.append(
                     self._dp_dpfna_eol_callback_gen(self.block_dp_storage.items.index(block_item)))
             elif self.is_dp_policy_rr_nn:
-                self.env.process(self._rr_nn_subloop_unlock_quota_n_sched(cur_block_id))
+                block_item['block_proc'] = self.env.process(self._rr_nn_subloop_unlock_quota_n_sched(cur_block_id))
 
 
     def _commit_dp_allocation(self, block_idx: List[int], epsilon: float):
@@ -1993,7 +2021,7 @@ class ResourceMaster(Component):
                 if self.env.config['workload_test.enabled']:
                     self.debug(
                         "unused dp quota after commit: %s (negative sign denotes committed block)" % pp.pformat(unused_dp))
-            elif self.is_decentralized_container_sched:
+            elif self.is_accum_container_sched:
                 for i, block in enumerate(self.block_dp_storage.items):
                     # uncommitted dp
                     if i in block_idx:
