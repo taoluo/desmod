@@ -10,7 +10,7 @@ setuptools_scm
 Sphinx
 sphinx-rtd-theme
 tox
-; to save gtkwave png
+pyvcd; parse vcd file
 path
 EasyProcess
 pyvirtualdisplay
@@ -18,4 +18,9 @@ pyscreenshot
 pillow
 docutils
 Sphinx
-pyDigitalWaveTools ; parse vcd file
+pyDigitalWaveTools; to save gtkwave png
+
+PyYAML
+progressbar2
+-e git+https://github.com/ttaoluo/simpy.git@3e78154#egg=simpy
+
