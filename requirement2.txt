@@ -1,0 +1,6 @@
+pyvcd
+PyYAML
+progressbar2
+colorma
+git+git://github.com:ttaoluo/simpy.git@3e78154#egg=simpy
+
