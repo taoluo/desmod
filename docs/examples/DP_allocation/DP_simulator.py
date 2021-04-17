@@ -764,20 +764,23 @@ class ResourceMaster(Component):
                 this_task["dp_permitted_event"].succeed()
                 permitted_task_ids.add(t_id)
                 permitted_blk_ids.update(task_demand_block_idx)
-                dp_processed_task_idx.append(idx)
+
                 # need to update consumption for following rejection
                 # fixme use copy of consumption curve for accounting and reject !!!!
                 self._commit_rdp_allocation(task_demand_block_idx, task_demand_e_rdp)
                 this_task["dp_committed_event"].succeed()
                 this_task['is_dp_granted'] = True
+                dp_processed_task_idx.append(idx)
             else:
                 assert is_quota_insufficient_all or is_quota_insufficient_any
                 if self.block_dp_storage.items[b]["retire_event"].triggered:
                     assert self.block_dp_storage.items[b]["retire_event"].ok
                     dp_rejected_task_ids.add(t_id)
+
                     this_task["dp_permitted_event"].fail(DpBlockRetiredError("block %d retired, insufficient unlocked rdp left" % b))
                     # this_task["dp_committed_event"].fail(DpBlockRetiredError()) #???? delay to handling permission
                     this_task['is_dp_granted'] = False
+                    dp_processed_task_idx.append(idx)
 
         return
 
@@ -1428,18 +1431,22 @@ class ResourceMaster(Component):
 
         resource_demand = this_task["resource_request"]
         # admission control
-        if self.is_admission_control_enabled:
+
+        # getevent -> blk_idx
+
+        if self.is_dp_policy_fcfs:
             this_task["is_admission_control_ok"] = self._check_task_admission_control(task_id)
             if not this_task["is_admission_control_ok"]:
                 return
-        # getevent -> blk_idx
-
-        elif self.is_dp_policy_fcfs:
             self._do_fcfs(task_id)
             # always grant because admission control is ok
             self.task_state[task_id]["is_dp_granted"] = True
 
         else: # policy other than fcfs
+            if self.is_admission_control_enabled:
+                this_task["is_admission_control_ok"] = self._check_task_admission_control(task_id)
+                if not this_task["is_admission_control_ok"]:
+                    return
             update_status = self._check_n_update_block_state(task_id)
             if update_status  == 1:
                 self.task_state[task_id]["is_dp_granted"] = False
