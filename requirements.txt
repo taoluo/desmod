@@ -10,7 +10,7 @@ setuptools_scm
 Sphinx
 sphinx-rtd-theme
 tox
-pyvcd; parse vcd file
+pyvcd
 path
 EasyProcess
 pyvirtualdisplay
@@ -18,7 +18,7 @@ pyscreenshot
 pillow
 docutils
 Sphinx
-pyDigitalWaveTools; to save gtkwave png
+pyDigitalWaveTools
 
 PyYAML
 progressbar2
