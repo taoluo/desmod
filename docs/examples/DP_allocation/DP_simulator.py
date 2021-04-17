@@ -299,7 +299,7 @@ class ResourceMaster(Component):
         self.dp_policy = self.env.config["resource_master.dp_policy"]
         self.is_dp_policy_fcfs = self.dp_policy == DP_POLICY_FCFS
         self.is_rdp = self.env.config['resource_master.dp_policy.is_rdp']
-
+        self.is_admission_control_enabled = self.env.config['resource_master.dp_policy.is_admission_control_enabled']
         self.is_dp_policy_dpfn = self.dp_policy == DP_POLICY_DPF_N
         self.is_dp_policy_dpft = self.dp_policy == DP_POLICY_DPF_T
         self.is_dp_policy_dpfna = self.dp_policy == DP_POLICY_DPF_NA
@@ -479,7 +479,10 @@ class ResourceMaster(Component):
                 # fixme coverage
                 else:
                     assert not self.task_state[sleeping_tid]['dp_committed_event'].ok
-                    raise Exception(
+                    if not self.task_state[sleeping_tid]['is_admission_control_ok']:
+                        _reject_resource(sleeping_tid)
+                    else:
+                        raise Exception(
                         "impossible to see dp rejected task in resource_waiting_tasks. This should already happen: failed dp commit -> "
                         "interrupt resoruce handler -> dequeue resource_waiting_tasks")
 
@@ -648,7 +651,9 @@ class ResourceMaster(Component):
             # HACK avoid calling get()
             dp_processed_task_idx.sort(reverse=True)
             for i in dp_processed_task_idx:
+                self.debug(self.dp_waiting_tasks.items[i], "task get dequeued from wait queue")
                 del self.dp_waiting_tasks.items[i]
+
 
             # self.dp_waiting_tasks.get(filter=lambda tid_item: tid_item == tid)
 
@@ -960,7 +965,7 @@ class ResourceMaster(Component):
                     self.task_state[msg["task_id"]]["task_publish_timestamp"] = None
 
                     self.task_state[msg["task_id"]]["is_dp_granted"] = None
-
+                    self.task_state[msg["task_id"]]["is_admission_control_ok"] = None
                     self.task_state[msg["task_id"]]["resource_allocated_event"] = msg.pop("resource_allocated_event")
                     self.task_state[msg["task_id"]]["dp_committed_event"] = msg.pop("dp_committed_event")
 
@@ -1015,16 +1020,27 @@ class ResourceMaster(Component):
             if this_task["handler_proc_resource"].is_alive:
                 this_task["handler_proc_resource"].interrupt(self._DP_HANDLER_INTERRUPT_MSG)
             dp_committed_event.fail(err)
-
+            removed_accum_cn = []
+            missing_waiting_accum_cn = []
+            fullfilled_blk = []
+            unfullfilled_blk = []
             for blk_idx, get_event in this_task["blk2accum_getters"].items():  # get_evt_block_mapping.items():
-                get_event.cancel() # if not triggered pop from waiters
-                get_event.defused = True
-                # only disable get, no pop container
-                #
+                if get_event.triggered and get_event.ok:
+                    fullfilled_blk.append(blk_idx)
+                elif (not get_event.triggered) or (not get_event.ok):
+                    unfullfilled_blk.append(blk_idx)
+                    get_event.cancel() # if not triggered pop from waiters
+                    get_event.defused = True
+
 
                 this_block = self.block_dp_storage.items[blk_idx]
                 dp_container = this_block["dp_container"]
-
+                # if isinstance(err, DprequestTimeoutError):
+                if task_id in this_block['waiting_tid2accum_containers']:
+                    this_block['waiting_tid2accum_containers'].pop(task_id)
+                    removed_accum_cn.append(task_id)
+                else:
+                    missing_waiting_accum_cn.append(blk_idx)
                 if get_event.triggered and get_event.ok:
                     if dp_container.level + get_event.amount < dp_container.capacity:
                         # dp_container.put(get_event.amount)
@@ -1037,7 +1053,21 @@ class ResourceMaster(Component):
                         assert dp_container.level + get_event.amount < dp_container.capacity + NUMERICAL_DELTA
                         # fixme disable dp return
                         # this_block['residual_dp'] = this_block['residual_dp'] + dp_container.capacity - dp_container.level
+            if len(removed_accum_cn)!=0:
+                self.debug(task_id, "accum containers removed by task handler for blocks %s" % removed_accum_cn )
 
+            if len(missing_waiting_accum_cn)!=0:
+                self.debug(task_id, "accum containers removed by sched for blocks %s" % removed_accum_cn )
+
+            self.debug(task_id, "fullfilled block demand getter: %s" % fullfilled_blk)
+            self.debug(task_id, "unfullfilled block demand getter: %s" % unfullfilled_blk)
+
+            # if isinstance(err,DprequestTimeoutError):
+            #     assert len(missing_waiting_accum_cn) == 0
+            # else:
+            #     assert len(missing_waiting_accum_cn) <= 1
+            # for b_idx in missing_waiting_accum_cn:
+            #     self.block_dp_storage.items[b_idx]['block_proc'].is_alive
             return 1
 
 
@@ -1115,6 +1145,8 @@ class ResourceMaster(Component):
                             i, capacity)))
                     return False
                 elif self.is_accum_container_sched and (not this_block['block_proc'].is_alive):
+                    dp_committed_event.fail(InsufficientDpException(
+                        "DP request is rejected by handler admission control, Block %d sched is inactive" % i ))
                     return False
         else:
             for b in resource_demand["block_idx"]:
@@ -1299,11 +1331,12 @@ class ResourceMaster(Component):
                 if not self.is_rdp:
                     for i in resource_demand["block_idx"]:
                         # need to wait to get per-task accum containers
+                        this_block = self.block_dp_storage.items[i]
                         accum_cn = DummyPutPool(self.env, capacity=resource_demand["epsilon"], init=0.0)
                         # will disable get event when when fail to grant.
-                        this_task["blk2accum_getters"][i] = accum_cn.get(resource_demand["epsilon"])
-                        this_block["tid2accum_containers"][task_id] = accum_cn
-                        self.debug("tid2accum_containers:  %d,  %d" % (task_id, i))
+                        this_task["blk2accum_getters"][i] = accum_cn.get(resource_demand["epsilon"]*(1-NUMERICAL_DELTA))
+                        this_block["waiting_tid2accum_containers"][task_id] = accum_cn
+                    self.debug("waiting_tid2accum_containers:  %d,  %s" % (task_id, resource_demand["block_idx"]))
                 else:
                     raise NotImplementedError('no rdp x RR')
             else:
@@ -1363,10 +1396,11 @@ class ResourceMaster(Component):
             # del self.dp_waiting_tasks.items[idx]
             if isinstance(err, DprequestTimeoutError):
                 del_idx = self.dp_waiting_tasks.items.index(task_id)
-                del self.dp_waiting_tasks.items[del_idx]
+
                 self.debug(task_id,
                            "dp request timeout after %d " % self.env.config['task.timeout.interval'])
-
+                self.debug(task_id, "task get dequeued from wait queue")
+                del self.dp_waiting_tasks.items[del_idx]
 
             self.debug(task_id, "policy=%s, fail to acquire dp: %s" % (self.dp_policy, err.__repr__()))
 
@@ -1386,7 +1420,7 @@ class ResourceMaster(Component):
 
 
             return 1
-
+# should trigger committed dp_committed_event after return
     def task_dp_handler(self, task_id):
         self.debug(task_id, "Task DP handler created")
         this_task = self.task_state[task_id]
@@ -1394,8 +1428,10 @@ class ResourceMaster(Component):
 
         resource_demand = this_task["resource_request"]
         # admission control
-        if not self._check_task_admission_control(task_id):
-            return
+        if self.is_admission_control_enabled:
+            this_task["is_admission_control_ok"] = self._check_task_admission_control(task_id)
+            if not this_task["is_admission_control_ok"]:
+                return
         # getevent -> blk_idx
 
         elif self.is_dp_policy_fcfs:
@@ -1475,7 +1511,7 @@ class ResourceMaster(Component):
             resource_allocated_event.fail(ResourceAllocFail("Abort resource request: %s" % err))
             defuse(resource_permitted_event)
             # interrupted while permitted
-            # more likely
+            # very likely
             if not resource_permitted_event.triggered:
                 assert task_id in self.resource_waiting_tasks.items
                 self.resource_waiting_tasks.get(filter=lambda x: x == task_id)
@@ -1587,25 +1623,27 @@ class ResourceMaster(Component):
         # yield this_block["retire_event"]
         yield self.env.timeout(self.env.config['resource_master.block.lifetime'])
         # allocate in ascending order
-        # waiting_cn = [(cn.capacity, cn) for tid, cn in this_block["tid2accum_containers"].items() ]
+        # waiting_cn = [(cn.capacity, cn) for tid, cn in this_block["waiting_tid2accum_containers"].items() ]
                                    # if (len(cn._get_waiters) != 0 and not cn._get_waiters[0].triggered) ]
-        waiting_task_cn_mapping = {tid: cn for tid, cn in this_block["tid2accum_containers"].items()
-                                   if (len(cn._get_waiters) == 1 and not cn._get_waiters[0].triggered)}
+        waiting_task_cn_mapping = this_block["waiting_tid2accum_containers"]
+        # {tid: cn for tid, cn in this_block["waiting_tid2accum_containers"].items()
+        #                            if (len(cn._get_waiters) == 1 and not cn._get_waiters[0].triggered)}
 
-        # if len(this_block["tid2accum_containers"]) > 0:
+        # if len(this_block["waiting_tid2accum_containers"]) > 0:
         if len(waiting_task_cn_mapping) > 0:
             total_alloc = 0 # this is inaccurate
             is_dp_sufficient = True
-            dp_quota_total = this_block["residual_dp"]
-
-            for task_id, cn in sorted(waiting_task_cn_mapping, key=lambda x:x[1].capacity):
-
-                if total_alloc + cn.capacity <= dp_quota_total + NUMERICAL_DELTA:
+            unlocked_dp_quota_total = this_block["residual_dp"]
+            waiting_tasks_asc =  list(sorted(waiting_task_cn_mapping, key=lambda x:x[1].capacity))
+            self.debug('block %d EOL, remove all waiting accum containers %s' % (block_id,waiting_tasks_asc))
+            for task_id in waiting_tasks_asc:
+                cn = waiting_task_cn_mapping[task_id]
+                if total_alloc + cn.capacity <= unlocked_dp_quota_total + NUMERICAL_DELTA:
 
                     cn.put(cn.capacity)
                     total_alloc = total_alloc + cn.capacity
                 elif is_dp_sufficient:
-                    # this_block["tid2accum_containers"].pop(task_id)
+
                     # fixme cancel event
                     waiting_evt = cn._get_waiters.pop(0)
                     waiting_evt.fail(InsufficientDpException(
@@ -1620,12 +1658,12 @@ class ResourceMaster(Component):
                     waiting_evt.fail(InsufficientDpException(
                         "block %d remaining uncommitted DP is insufficient for remaining ungranted dp of task %d" % (
                             block_id, task_id)))
-
-
+                # remove all waiting accum cn at the eol
+                this_block["waiting_tid2accum_containers"].pop(task_id)
 
         # fail others waiting tasks
 
-    ## for RR T policy
+    ## for RR N policy
     def _rr_nn_subloop_unlock_quota_n_sched(self, block_id):
 
         this_block = self.block_dp_storage.items[block_id]
@@ -1670,8 +1708,7 @@ class ResourceMaster(Component):
             get_amount_01 = get_amount
             level_01 = this_block["dp_container"].level
             # only allocate among active getter tasks
-            waiting_task_cn_mapping = {tid: cn for tid, cn in this_block["tid2accum_containers"].items()
-                                       if (len(cn._get_waiters) ==1  and not cn._get_waiters[0].triggered)}
+            waiting_task_cn_mapping = this_block["waiting_tid2accum_containers"]
 
             # fail active waiting task that are impossible to grant
             # copy, to avoid iterate over a changing dictionary
@@ -1703,15 +1740,16 @@ class ResourceMaster(Component):
                     yield self.env.timeout(delay=0) # may update residual ??????
 
                 for tid, dp_alloc_amount in fair_allocation.items():
-                    cn = this_block["tid2accum_containers"][tid]
-                    get_amount = cn._get_waiters[0].amount
+                    cn = this_block["waiting_tid2accum_containers"][tid]
+                    # get_amount = cn._get_waiters[0].amount
                     # fill to trigger get
-                    level_00 = cn.level
-                    if NUMERICAL_DELTA < (get_amount - cn.level) - dp_alloc_amount < NUMERICAL_DELTA:
-                        dp_alloc_amount = get_amount - cn.level
-                        cn.put(get_amount - cn.level)
-                        assert dp_alloc_amount == desired_dp[tid]
-                        assert cn.level == cn._get_waiters[0].amount
+                    # level_00 = cn.level
+
+                    if -NUMERICAL_DELTA < (cn.capacity  - cn.level) - dp_alloc_amount < NUMERICAL_DELTA:
+                        dp_alloc_amount = cn.capacity - cn.level
+                        cn.put(dp_alloc_amount)
+                        this_block["waiting_tid2accum_containers"].pop(tid)
+                        self.debug(tid, "accum containers granted and removed for block %s" % block_id)
                     else:
                         cn.put(dp_alloc_amount)
 
@@ -1723,20 +1761,21 @@ class ResourceMaster(Component):
         # now >= end of life
         # wait for dp getter event processed, reject untriggered get
         yield self.env.timeout(delay=0)
-        rej_waiting_task_cn_mapping = {tid: cn for tid, cn in this_block["tid2accum_containers"].items()
-                                   if (len(cn._get_waiters) == 1 and not cn._get_waiters[0].triggered)}
+        rej_waiting_task_cn_mapping = this_block["waiting_tid2accum_containers"]
 
         if len(rej_waiting_task_cn_mapping) != 0:
             self.debug("block %d last period of lifetime, with waiting tasks: " % block_id,
                        list(rej_waiting_task_cn_mapping.keys()))
-            for task_id, cn in rej_waiting_task_cn_mapping.items():
+            for task_id in list(rej_waiting_task_cn_mapping.keys()):
+                cn = rej_waiting_task_cn_mapping[task_id]
                 # assert len(cn._get_waiters) == 1
                 # avoid getter triggered by cn
                 waiting_evt = cn._get_waiters.pop(0)
                 waiting_evt.fail(StopReleaseDpError(
-                    "aaa task %d rejected dp, due to block %d has stopped release" % (task_id, block_id)))
+                    "task %d rejected dp, due to block %d has stopped release" % (task_id, block_id)))
+                this_block["waiting_tid2accum_containers"].pop(task_id)
         else:
-            self.debug("block %d out of life, with NO waiting task" % block_id)
+            self.debug("block %d out of dp, with NO waiting task" % block_id)
         # assert this_block["retire_event"] is False
 
 
@@ -1769,6 +1808,7 @@ class ResourceMaster(Component):
             elif t == total_ticks:
                 # assert -NUMERICAL_DELTA < this_block["dp_container"].level - get_amount < NUMERICAL_DELTA
                 get_amount = this_block["dp_container"].level
+                this_block["retire_event"].succeed()
 
             if get_amount != 0:
                 this_block["dp_container"].get(get_amount)
@@ -1778,8 +1818,9 @@ class ResourceMaster(Component):
             get_amount_01 = get_amount
             level_01 = this_block["dp_container"].level
             # only allocate among active getter tasks
-            waiting_task_cn_mapping = {tid: cn for tid, cn in this_block["tid2accum_containers"].items()
-                                       if (len(cn._get_waiters) ==1  and not cn._get_waiters[0].triggered)}
+            waiting_task_cn_mapping = this_block["waiting_tid2accum_containers"]
+            # {tid: cn for tid, cn in this_block["waiting_tid2accum_containers"].items()
+            #                            if (len(cn._get_waiters) ==1  and not cn._get_waiters[0].triggered)}
 
             # fail active waiting task that are impossible to grant
             # copy, to avoid iterate over a changing dictionary
@@ -1808,18 +1849,22 @@ class ResourceMaster(Component):
 
                 else:
                     this_block["residual_dp"] = 0.0
-                    yield self.env.timeout(delay=0) # may update residual ??????
+                    # yield self.env.timeout(delay=0) # this may update residual ??????
 
                 for tid, dp_alloc_amount in fair_allocation.items():
-                    cn = this_block["tid2accum_containers"][tid]
-                    get_amount = cn._get_waiters[0].amount
+                    cn = this_block["waiting_tid2accum_containers"][tid]
+                    # get_amount = cn._get_waiters[0].amount
+                    # assert get_amount==cn.capacity
                     # fill to trigger get
-                    level_00 = cn.level
-                    if NUMERICAL_DELTA < (get_amount - cn.level) - dp_alloc_amount < NUMERICAL_DELTA:
-                        dp_alloc_amount = get_amount - cn.level
-                        cn.put(get_amount - cn.level)
-                        assert dp_alloc_amount == desired_dp[tid]
-                        assert cn.level == cn._get_waiters[0].amount
+                    # level_00 = cn.level
+                    if - NUMERICAL_DELTA < (cn.capacity - cn.level) - dp_alloc_amount < NUMERICAL_DELTA:
+                        dp_alloc_amount = cn.capacity - cn.level
+                        cn.put(dp_alloc_amount)
+                        # yield self.env.timeout(0)
+                        # assert cn._get_waiters[0].triggered
+                        this_block["waiting_tid2accum_containers"].pop(tid)
+                        self.debug(tid, "accum containers granted and removed for block %s" % block_id)
+                        # assert cn.level == cn._get_waiters[0].amount
                     else:
                         cn.put(dp_alloc_amount)
 
@@ -1831,22 +1876,25 @@ class ResourceMaster(Component):
         # now >= end of life
         # wait for dp getter event processed, reject untriggered get
         yield self.env.timeout(delay=0)
-        rej_waiting_task_cn_mapping = {tid: cn for tid, cn in this_block["tid2accum_containers"].items()
-                                   if (len(cn._get_waiters) == 1 and not cn._get_waiters[0].triggered)}
+        rej_waiting_task_cn_mapping = this_block["waiting_tid2accum_containers"] #{tid: cn for tid, cn in this_block["waiting_tid2accum_containers"].items()
+                                   # if (len(cn._get_waiters) == 1 and not cn._get_waiters[0].triggered)}
 
         if len(rej_waiting_task_cn_mapping) != 0:
-            self.debug("block %d last period of lifetime, with waiting tasks: " % block_id,
-                       list(rej_waiting_task_cn_mapping.keys()))
-            for task_id, cn in rej_waiting_task_cn_mapping.items():
+            self.debug("block %d EOL, removing accum containers for waiting tasks: %s" % (block_id,
+                       list(rej_waiting_task_cn_mapping.keys())) )
+            for task_id in list(rej_waiting_task_cn_mapping.keys()):
+                cn = rej_waiting_task_cn_mapping[task_id]
                 # assert len(cn._get_waiters) == 1
                 # avoid getter triggered by cn
                 waiting_evt = cn._get_waiters.pop(0)
                 waiting_evt.fail(StopReleaseDpError(
-                    "aaa task %d rejected dp, due to block %d has stopped release" % (task_id, block_id)))
+                    "aaa task %d rejected dp, due to block %d has run out of dp" % (task_id, block_id)))
+                this_block["waiting_tid2accum_containers"].pop(task_id)
+            # self.debug("block %d run out of dp, accum containers removed for tasks %s" % (block_id, list(rej_waiting_task_cn_mapping.keys()) ))
         else:
-            self.debug("block %d out of life, with NO waiting task" % block_id)
+            self.debug("block %d run out of dp, with NO waiting task" % block_id)
         # assert this_block["retire_event"] is False
-        this_block["retire_event"].succeed()
+
 
         return 0
 
@@ -1938,7 +1986,7 @@ class ResourceMaster(Component):
                 "dp_quota": new_quota,  # for dpf policy
                 # lifetime :=  # of periods from born to end
                 "end_of_life": EOL,
-                "tid2accum_containers": accum_cn_dict,  # task_id: container, for rate limiting policy
+                "waiting_tid2accum_containers": accum_cn_dict,  # task_id: container, for rate limiting policy
                 # 'is_dead': is_dead, # only for RR
                 "retire_event": self.env.event(),
                 'arrived_task_num': 0,
@@ -2525,13 +2573,14 @@ if __name__ == '__main__':
     is_factor_rdp = True
 
     run_test_by_factor = True
+
     config = {
         'workload_test.enabled': False,
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
         'task.arrival_interval': 1,
         'task.timeout.interval': 50,
         'task.timeout.enabled': True,
-
+        
 
         'task.demand.num_blocks.mice': 1,
         'task.demand.num_blocks.elephant': 10,
@@ -2579,14 +2628,16 @@ if __name__ == '__main__':
         # todo fcfs rdp
         # 'resource_master.dp_policy': DP_POLICY_FCFS,
         # policy
-        'resource_master.dp_policy.is_rdp': True,
-        'resource_master.dp_policy': DP_POLICY_DPF_T,
+
+        'resource_master.dp_policy.is_admission_control_enabled': False,
+        'resource_master.dp_policy.is_rdp': False,
+        'resource_master.dp_policy': DP_POLICY_RR_T,
         'resource_master.dp_policy.denominator': 100,
         'resource_master.block.lifetime': 100 * 10,  # policy level param
         # workload
-        'resource_master.block.is_static': True,
-        'resource_master.block.init_amount': 1,  # for block elephant demand
-        'task.demand.num_blocks.mice_percentage': 100.0,
+        'resource_master.block.is_static': False,
+        'resource_master.block.init_amount': 10,  # for block elephant demand
+        'task.demand.num_blocks.mice_percentage': 75.0,
 
         # https://cloud.google.com/compute/docs/gpus
         # V100 VM instance
@@ -2775,7 +2826,7 @@ if __name__ == '__main__':
     N_rdp = 14514
     T_rdp = 10 * 14514
 
-    test_factors = [(['sim.duration'], [['%d s' % 10000 ]]), # 250000
+    test_factors = [(['sim.duration'], [['%d s' % 250000 ]]), # 250000
                     (['resource_master.block.is_static', 'resource_master.block.init_amount', 'task.demand.num_blocks.mice_percentage'],
                      [[True, 1,100], # single block
                       [False, 10, 75]],  # dynamic block
