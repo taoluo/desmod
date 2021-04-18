@@ -193,9 +193,8 @@ class Top(Component):
         self.tasks = Tasks(self)
         self.resource_master = ResourceMaster(self)
         tick_seconds = self.env.config['resource_master.clock.tick_seconds']
-        if self.env.config['resource_master.block.lifetime'] and self.env.config[
-            'resource_master.clock.dpf_adaptive_tick']:
-            tick_seconds = self.env.config['task.arrival_interval'] * 0.66 # median arrival time 0.68
+        if self.env.config['resource_master.clock.dpf_adaptive_tick']:
+            tick_seconds = self.env.config['task.arrival_interval']  # median arrival time x0.68
         # tick_seconds = 0.5
         self.global_clock = Clock(tick_seconds, self)
         self.add_process(self.timeout_stop)
