@@ -1944,8 +1944,8 @@ class ResourceMaster(Component):
                     self.debug('epsilon initial static data blocks: %s' % pp.pformat(
                         [blk['dp_container'].capacity for blk in self.block_dp_storage.items]))
                     return
-                else:
-                    yield self.env.timeout(self.env.config["resource_master.block.arrival_interval"])
+                # else:
+                    # yield self.env.timeout(self.env.config["resource_master.block.arrival_interval"])
 
             # generate block_id
             cur_block_id = next(block_id)
@@ -2570,22 +2570,29 @@ select avg(a)from (
 
 if __name__ == '__main__':
     import copy
+    dp_arrival_itvl = 0.078125    
+    rdp_arrival_itvl = 0.004264781
+    N_dp = 100
+    T_dp = rdp_arrival_itvl * N_dp
+
+    N_rdp = 14514
+    T_rdp = rdp_arrival_itvl * N_rdp
+
 
     run_test_single = False
     run_test_many = False
     run_test_parallel = False
-    run_factor = True
+    run_factor = False
     is_factor_single_block = False
     is_factor_rdp = False
 
-    run_test_by_factor = False
+    run_test_by_factor = True
 
     config = {
         'workload_test.enabled': False,
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
-        'task.arrival_interval': 1,
-        'task.timeout.interval': 50,
-        'task.timeout.enabled': True,
+        
+
         
 
         'task.demand.num_blocks.mice': 1,
@@ -2594,7 +2601,6 @@ if __name__ == '__main__':
         'task.demand.num_blocks.mu': 20,
         'task.demand.num_blocks.sigma': 10,
         # num_blocks * 1/mean_tasks_per_block = 1/10
-        'task.demand.epsilon.mice_percentage': 75.0,
         'task.demand.epsilon.mean_tasks_per_block': 15,
         'task.demand.epsilon.mice': 1e-2, # N < 100
         'task.demand.epsilon.elephant': 1e-1,
@@ -2634,16 +2640,21 @@ if __name__ == '__main__':
         # todo fcfs rdp
         # 'resource_master.dp_policy': DP_POLICY_FCFS,
         # policy
-
+        
+        'sim.duration': '300 s',
+        'task.timeout.interval': 25,
+        'task.timeout.enabled': True,
+        'task.arrival_interval': rdp_arrival_itvl,
         'resource_master.dp_policy.is_admission_control_enabled': False,
-        'resource_master.dp_policy.is_rdp': False,
-        'resource_master.dp_policy': DP_POLICY_RR_T,
-        'resource_master.dp_policy.denominator': 100,
-        'resource_master.block.lifetime': 100 * 10,  # policy level param
+        'resource_master.dp_policy.is_rdp': True,
+        'resource_master.dp_policy': DP_POLICY_DPF_N,
+        'resource_master.dp_policy.denominator': N_rdp,
+        'resource_master.block.lifetime': T_rdp,  # policy level param
         # workload
         'resource_master.block.is_static': False,
-        'resource_master.block.init_amount': 10,  # for block elephant demand
+        'resource_master.block.init_amount': 11,  # for block elephant demand
         'task.demand.num_blocks.mice_percentage': 75.0,
+        'task.demand.epsilon.mice_percentage': 75.0,
 
         # https://cloud.google.com/compute/docs/gpus
         # V100 VM instance
@@ -2659,7 +2670,7 @@ if __name__ == '__main__':
         'sim.dot.colorscheme': 'blues5',
         'sim.dot.enable': False,
         # 'sim.duration': '300000 s',  # for rdp
-        'sim.duration': '30000 s',
+
         'sim.runtime.timeout': 60,  # in min
         # 'sim.duration': '10 s',
         'sim.gtkw.file': 'sim.gtkw',
@@ -2826,16 +2837,11 @@ if __name__ == '__main__':
                  list(chain([[i,75] for i in [1, 2500,5000,10000, 20000,25000]], [[15000,j] for j in epsilon_mice_pct] )) ) ,
                 (['task.timeout.interval'],[[task_timeout_global]]),  # fixme use filter is more concise
                ]
-    N_dp = 100
-    T_dp = 10 * 100
 
-    N_rdp = 14514
-    T_rdp = 10 * 14514
-
-    test_factors = [(['sim.duration'], [['%d s' % 250000 ]]), # 250000
+    test_factors = [(['sim.duration'], [['%d s' % 300 ]]), # 250000
                     (['resource_master.block.is_static', 'resource_master.block.init_amount', 'task.demand.num_blocks.mice_percentage'],
                      [[True, 1,100], # single block
-                      [False, 10, 75]],  # dynamic block
+                      [False, 11, 75]],  # dynamic block
                      ),
 
                     (['resource_master.dp_policy.is_rdp','resource_master.dp_policy','resource_master.dp_policy.denominator','resource_master.block.lifetime'],
