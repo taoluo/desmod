@@ -195,8 +195,7 @@ class Top(Component):
         tick_seconds = self.env.config['resource_master.clock.tick_seconds']
         if self.env.config['resource_master.block.lifetime'] and self.env.config[
             'resource_master.clock.dpf_adaptive_tick']:
-            tick_seconds = self.env.config['resource_master.block.lifetime'] * self.env.config[
-                'task.demand.epsilon.mice'] * 0.70
+            tick_seconds = self.env.config['task.arrival_interval'] * 0.66 # median arrival time 0.68
         # tick_seconds = 0.5
         self.global_clock = Clock(tick_seconds, self)
         self.add_process(self.timeout_stop)
@@ -2575,11 +2574,11 @@ if __name__ == '__main__':
     run_test_single = False
     run_test_many = False
     run_test_parallel = False
-    run_factor = False
-    is_factor_single_block = True
-    is_factor_rdp = True
+    run_factor = True
+    is_factor_single_block = False
+    is_factor_rdp = False
 
-    run_test_by_factor = True
+    run_test_by_factor = False
 
     config = {
         'workload_test.enabled': False,
@@ -2800,7 +2799,7 @@ if __name__ == '__main__':
         load_filter = sparse_load_filter
         load_filter = lambda x: True
 
-    factors = [(['sim.duration'], [['%d s' % 250000 ]]),
+    factors = [(['sim.duration'], [['%d s' % 10000 ]]),
                (['resource_master.block.is_static'], [[is_static_block]]),
                (['resource_master.block.init_amount'], [[init_blocks]]),
                (['task.demand.num_blocks.mice_percentage'], [[i] for i in blk_nr_mice_pct]),
@@ -2814,7 +2813,7 @@ if __name__ == '__main__':
                            rate_limit_factors))),  # rate_limit_factors, dpf_t_factors, dpf_n_factors,
                ]
 
-    factors_rdp = [
+    factors_rdp = [(['sim.duration'], [['%d s' % 10000 ]]),
                (['resource_master.block.is_static'], [[is_static_block]]),
                (['resource_master.block.init_amount'], [[init_blocks]]),
                (['task.demand.num_blocks.mice_percentage'], [[100,]] ),# [[i] for i in blk_nr_mice_pct]),
