@@ -527,12 +527,14 @@ class ResourceMaster(Component):
         assert len(block_idx) > 0
 
         temp_balance = []
+        temp_quota_balance = []
         for b in block_idx:
             for j,e in enumerate(e_rdp):
                 self.block_dp_storage.items[b]["rdp_consumption"][j] += e
                 temp_balance.append(self.block_dp_storage.items[b]["rdp_budget_curve"][j] - self.block_dp_storage.items[b]["rdp_consumption"][j])
+                temp_quota_balance.append(self.block_dp_storage.items[b]["rdp_quota_curve"][j] - self.block_dp_storage.items[b]["rdp_consumption"][j])
             assert(max(temp_balance) >= 0)
-
+            self.block_dp_storage.items[b]["rdp_quota_balance"] = temp_quota_balance
 
     def scheduling_dp_loop(self):
         assert self.is_centralized_quota_sched
@@ -706,7 +708,7 @@ class ResourceMaster(Component):
                     this_task["dp_permitted_event"].fail(DpBlockRetiredError())
                     dp_rejected_task_ids.add(t_id)
                     dp_processed_task_idx.append(idx)
-
+    # @profile
     def best_effort_rdp_sched_n_commit_reject(self, dp_processed_task_idx, dp_rejected_task_ids, permit_dp_task_order,
                                               permitted_blk_ids, permitted_task_ids):
         for idx, t_id in permit_dp_task_order:
@@ -733,8 +735,7 @@ class ResourceMaster(Component):
                         self.block_dp_storage.items[b]["retire_event"].triggered and self.block_dp_storage.items[b][
                     "retire_event"].ok):
                     for j, e_d in enumerate(task_demand_e_rdp):
-                        if e_d <= self.block_dp_storage.items[b]['rdp_quota_curve'][j] - \
-                                self.block_dp_storage.items[b]["rdp_consumption"][j]:
+                        if e_d <= self.block_dp_storage.items[b]['rdp_quota_balance'][j]:
                             break
                     else:
                         is_quota_insufficient_all = True
@@ -744,8 +745,7 @@ class ResourceMaster(Component):
                 elif self.rdp_bound_mode == FULL_BOUNDED_RDP:
                     for j, e_d in enumerate(task_demand_e_rdp):
                         if self.block_dp_storage.items[b]['rdp_budget_curve'][j] > 0 and e_d > \
-                                self.block_dp_storage.items[b]['rdp_quota_curve'][j] - \
-                                self.block_dp_storage.items[b]["rdp_consumption"][j]:
+                                self.block_dp_storage.items[b]['rdp_quota_balance'][j]:
 
                             is_quota_insufficient_any = True
                             break
@@ -835,17 +835,18 @@ class ResourceMaster(Component):
     def _cal_drs_rdp_a_all(self):
         for t_id in reversed(self.dp_waiting_tasks.items):
             this_task = self.task_state[t_id]
-            this_request = this_task['resource_request']
-            # block wise
-            temp_max = -1
-            for b in this_request['block_idx']:
-                for j, e in enumerate(this_request['e_rdp']):
-                    # iterate over all alpha demand
-                    if self.block_dp_storage.items[b]["rdp_budget_curve"][j] > 0:
-                        normalized_e = e / self.block_dp_storage.items[b]["rdp_budget_curve"][j]
-                        temp_max = max(temp_max, normalized_e)
-            assert temp_max != -1
-            this_task['dominant_resource_share'] = temp_max
+            if this_task['dominant_resource_share'] is None:
+                this_request = this_task['resource_request']
+                # block wise
+                temp_max = -1
+                for b in this_request['block_idx']:
+                    for j, e in enumerate(this_request['e_rdp']):
+                        # iterate over all alpha demand
+                        if self.block_dp_storage.items[b]["rdp_budget_curve"][j] > 0:
+                            normalized_e = e / self.block_dp_storage.items[b]["rdp_budget_curve"][j]
+                            temp_max = max(temp_max, normalized_e)
+                assert temp_max != -1
+                this_task['dominant_resource_share'] = temp_max
 
     def _cal_drs_rdp_a_positive(self):
         for t_id in reversed(self.dp_waiting_tasks.items):
@@ -1959,7 +1960,7 @@ class ResourceMaster(Component):
                     total_delta = self.env.config['resource_master.block.init_delta']
                     total_rdp = max(0, total_dp - math.log(1/total_delta) / (a - 1 ))
                     rdp_budget_curve.append(total_rdp) # DummyPool(self.env, capacity=total_rdp, init=total_rdp, name=a, hard_cap=True)
-                # rdp_balance = rdp_budget_curve.copy()
+                # rdp_quota_balance = rdp_budget_curve.copy()
 
 
 
@@ -1986,9 +1987,10 @@ class ResourceMaster(Component):
                 "global_epsilon_dp": total_dp,
                 "dp_container": new_block,
                 "rdp_budget_curve": rdp_budget_curve,
-                # "rdp_balance": rdp_balance,
+                # "rdp_quota_balance": rdp_quota_balance,
                 "rdp_quota_curve": [0.0,] * len(rdp_budget_curve),
                 "rdp_consumption": [0.0,] * len(rdp_budget_curve),
+                "rdp_quota_balance": [0.0, ] * len(rdp_budget_curve), # balance = quota - consumption
                 "dp_quota": new_quota,  # for dpf policy
                 # lifetime :=  # of periods from born to end
                 "end_of_life": EOL,
