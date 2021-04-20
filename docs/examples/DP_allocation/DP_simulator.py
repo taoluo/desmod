@@ -2532,8 +2532,15 @@ class Tasks(Component):
                      resource_request_msg["cpu"], resource_request_msg["gpu"], resource_request_msg["memory"], t0,
                      ),
                 )
+            for i in range(20): # try 20 times
+                try:
+                    db_init_task()
+                    break
+                except Exception as e:
+                    time.sleep(0.3)
+            else:
+                raise(e)
 
-            db_init_task()
 
         dp_grant, task_exec = yield self.env.all_of([waiting_for_dp, running_task])
 
@@ -2579,12 +2586,14 @@ class Tasks(Component):
                      self.resource_master.task_state[task_id]["task_completion_timestamp"],
                      self.resource_master.task_state[task_id]["task_publish_timestamp"],task_id),
                 )
-
-            try:
-                db_update_task()
-            except Exception as e:
-                time.sleep(0.3)
-                db_update_task()
+            for i in range(20): # try 20 times
+                try:
+                    db_update_task()
+                    break
+                except Exception as e:
+                    time.sleep(0.3)
+            else:
+                raise(e)
         return
 
     def get_result_hook(self, result):
