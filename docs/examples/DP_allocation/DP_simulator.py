@@ -561,15 +561,17 @@ class ResourceMaster(Component):
     def _commit_rdp_allocation(self, block_idx: List[int], e_rdp: List[float]):
         assert len(block_idx) > 0
 
-        temp_balance = []
-        temp_quota_balance = []
+
+
         for b in block_idx:
             # todo perf use iterator + map?
+            temp_balance = []
+            temp_quota_balance = []
             for j,e in enumerate(e_rdp):
                 self.block_dp_storage.items[b]["rdp_consumption"][j] += e
                 temp_balance.append(self.block_dp_storage.items[b]["rdp_budget_curve"][j] - self.block_dp_storage.items[b]["rdp_consumption"][j])
                 temp_quota_balance.append(self.block_dp_storage.items[b]["rdp_quota_curve"][j] - self.block_dp_storage.items[b]["rdp_consumption"][j])
-            assert(max(temp_balance) >= 0)
+            assert max(temp_balance) >= (0 - NUMERICAL_DELTA)
             self.block_dp_storage.items[b]["rdp_quota_balance"] = temp_quota_balance
 
     def scheduling_dp_loop(self):
