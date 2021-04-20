@@ -89,8 +89,8 @@ if __name__ == '__main__':
         'resource_master.clock.tick_seconds': 25,
         'resource_master.clock.dpf_adaptive_tick': True,
 
-        'sim.db.enable': False,
-        'sim.db.persist': False,
+        'sim.db.enable': True,
+        'sim.db.persist': True,
         'sim.dot.colorscheme': 'blues5',
         'sim.dot.enable': False,
         # 'sim.duration': '300000 s',  # for rdp
@@ -106,8 +106,8 @@ if __name__ == '__main__':
         'sim.seed': 23338,
         'sim.timescale': 's',
         'sim.vcd.dump_file': 'sim_dp.vcd',
-        'sim.vcd.enable': False,
-        'sim.vcd.persist': False,
+        'sim.vcd.enable': True,
+        'sim.vcd.persist': True,
         'sim.workspace': 'exp_result/workspace_%s' % datetime.now().strftime("%m-%d-%HH-%M-%S"),
         'sim.workspace.overwrite': True,
 
