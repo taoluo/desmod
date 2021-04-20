@@ -106,8 +106,8 @@ if __name__ == '__main__':
         'sim.seed': 23338,
         'sim.timescale': 's',
         'sim.vcd.dump_file': 'sim_dp.vcd',
-        'sim.vcd.enable': True,
-        'sim.vcd.persist': True,
+        'sim.vcd.enable': False,
+        'sim.vcd.persist': False,
         'sim.workspace': 'exp_result/workspace_%s' % datetime.now().strftime("%m-%d-%HH-%M-%S"),
         'sim.workspace.overwrite': True,
 
