@@ -11,7 +11,7 @@ from itertools import count, tee, chain, repeat, product
 import simpy
 import sys
 import timeit
-
+import operator
 # from numba import jit
 from datetime import datetime
 import math
@@ -55,11 +55,12 @@ from desmod.simulation import simulate, simulate_factors, simulate_many
 from collections import OrderedDict
 import pprint as pp
 import simpy as sim
+import copy
 
 from desmod.simulation import (
     SimEnvironment,
     SimStopEvent, )
-
+NoneType = type(None)
 ALLOCATION_SUCCESS = "V"
 ALLOCATION_FAIL = "F"
 ALLOCATION_REQUEST = "allocation_request"
@@ -192,9 +193,10 @@ class Top(Component):
         super().__init__(*args, **kwargs)
         self.tasks = Tasks(self)
         self.resource_master = ResourceMaster(self)
-        tick_seconds = self.env.config['resource_master.clock.tick_seconds']
+        # tick_seconds = self.env.config['resource_master.clock.tick_seconds']
         if self.env.config['resource_master.clock.dpf_adaptive_tick']:
-            tick_seconds = self.env.config['task.arrival_interval']  # median arrival time x0.68
+            tick_seconds = self.env.config['task.arrival_interval'] * 5 # median arrival time x0.68
+            self.env.config['resource_master.clock.tick_seconds'] = tick_seconds
         # tick_seconds = 0.5
         self.global_clock = Clock(tick_seconds, self)
         self.add_process(self.timeout_stop)
@@ -294,6 +296,10 @@ class ResourceMaster(Component):
         super().__init__(*args, **kwargs)
         self.add_connections('global_clock')
         self._retired_blocks = set()
+        self._avg_num_blocks = (self.env.config['task.demand.num_blocks.mice'] + self.env.config[
+            'task.demand.num_blocks.elephant']) / 2
+        self._avg_epsilon = (self.env.config['task.demand.epsilon.mice'] + self.env.config[
+            'task.demand.epsilon.elephant']) / 2
         self.dp_policy = self.env.config["resource_master.dp_policy"]
         self.is_dp_policy_fcfs = self.dp_policy == DP_POLICY_FCFS
         self.is_rdp = self.env.config['resource_master.dp_policy.is_rdp']
@@ -503,6 +509,36 @@ class ResourceMaster(Component):
                 if self._is_idle_resource_enough(sleeping_tid, this_epoch_idle_resources):
                     _permit_resource(sleeping_tid, this_epoch_idle_resources)
 
+    # @classmethod
+    # def _cached_avg(self,_is_mice_dp_demand):
+    #
+    #     avg_num_blocks = (self.env.config['task.demand.num_blocks.mice'] + self.env.config[
+    #         'task.demand.num_blocks.elephant']) / 2
+    #     avg_epsilon = (self.env.config['task.demand.epsilon.mice'] + self.env.config[
+    #         'task.demand.epsilon.elephant']) / 2
+    #
+    #     def classify(epsilon,num_blocks):
+    #         return _is_mice_dp_demand(epsilon, num_blocks,avg_epsilon,avg_num_blocks)
+    #
+    #     return classify
+
+    # class Decorators(object):
+    #     @classmethod
+    #     def _cached_avg(cls, _is_mice_dp_demand):
+    #         avg_num_blocks = (cls.env.config['task.demand.num_blocks.mice'] + cls.env.config[
+    #             'task.demand.num_blocks.elephant']) / 2
+    #         avg_epsilon = (cls.env.config['task.demand.epsilon.mice'] + cls.env.config[
+    #             'task.demand.epsilon.elephant']) / 2
+    #
+    #         def classify(epsilon, num_blocks):
+    #             return _is_mice_dp_demand(epsilon, num_blocks, avg_epsilon, avg_num_blocks)
+    #
+    #         return classify
+
+    # @Decorators._cached_avg
+    def _is_mice_task_dp_demand(self, epsilon, num_blocks):
+        return epsilon < self._avg_epsilon, num_blocks < self._avg_num_blocks
+
     def _is_idle_resource_enough(self, tid, idle_resources):
         if idle_resources['cpu_level'] < self.task_state[tid]['resource_request']['cpu']:
             return False
@@ -528,6 +564,7 @@ class ResourceMaster(Component):
         temp_balance = []
         temp_quota_balance = []
         for b in block_idx:
+            # todo perf use iterator + map?
             for j,e in enumerate(e_rdp):
                 self.block_dp_storage.items[b]["rdp_consumption"][j] += e
                 temp_balance.append(self.block_dp_storage.items[b]["rdp_budget_curve"][j] - self.block_dp_storage.items[b]["rdp_consumption"][j])
@@ -1181,6 +1218,10 @@ class ResourceMaster(Component):
             self._commit_rdp_allocation(resource_demand["block_idx"], resource_demand["e_rdp"])
             this_task["dp_committed_event"].succeed()
 
+    def _rdp_update_quota_balance(self, blk_idx):
+        this_block = self.block_dp_storage.items[blk_idx]
+        this_block['rdp_quota_balance'] = list(
+            map(lambda d: d[0] - d[1], zip(this_block['rdp_quota_curve'], this_block['rdp_consumption'])))
 
     def _check_n_update_block_state(self, task_id):
         this_task = self.task_state[task_id]
@@ -1309,6 +1350,7 @@ class ResourceMaster(Component):
                         else:
                             this_block['rdp_quota_curve'] = this_block[
                                 'rdp_budget_curve'].copy()
+
                         new_quota_unlocked = True
                     else:
                         raise Exception('fweaew')
@@ -1319,8 +1361,12 @@ class ResourceMaster(Component):
                 else:
                     raise NotImplementedError()
 
+
             if self.does_task_handler_unlock_quota and new_quota_unlocked:
                 quota_increment_idx.append(i)
+                if self.is_rdp:
+                    self._rdp_update_quota_balance(i)
+
 
             if self.is_N_based_retire and (this_block["arrived_task_num"] == self.denom):
                 this_block["retire_event"].succeed()
@@ -1574,6 +1620,7 @@ class ResourceMaster(Component):
             else:
                 this_block['rdp_quota_curve'] = this_block[
                     'rdp_budget_curve'].copy()
+                self._rdp_update_quota_balance(block_id)
 
             self.dp_sched_mail_box.put([block_id])
             # assert this_block["retire_event"] is False
@@ -1601,6 +1648,7 @@ class ResourceMaster(Component):
                 this_block["dp_quota"].put(put_amount)
             else:
                 this_block['rdp_quota_curve'] = [ b*((t+1)/total_ticks) for b in this_block['rdp_budget_curve']]
+                self._rdp_update_quota_balance(block_id)
             self.debug('block_id %d release %.3f fraction at %.3f' % (block_id,  (t+1)/total_ticks, self.env.now))
             self.dp_sched_mail_box.put([block_id])
             if t + 1 != total_ticks:
@@ -2163,6 +2211,18 @@ class Tasks(Component):
         self.task_granted_count = DummyPool(self.env)
         self.auto_probe('task_granted_count', vcd={})
 
+        self.tasks_granted_count_s_dp_s_blk = DummyPool(self.env)
+        self.auto_probe('tasks_granted_count_s_dp_s_blk', vcd={})
+
+        self.tasks_granted_count_s_dp_l_blk = DummyPool(self.env)
+        self.auto_probe('tasks_granted_count_s_dp_l_blk', vcd={})
+
+        self.tasks_granted_count_l_dp_s_blk = DummyPool(self.env)
+        self.auto_probe('tasks_granted_count_l_dp_s_blk', vcd={})
+
+        self.tasks_granted_count_l_dp_l_blk = DummyPool(self.env)
+        self.auto_probe('tasks_granted_count_l_dp_l_blk', vcd={})
+
         self.task_dp_rejected_count = DummyPool(self.env)
         self.auto_probe('task_dp_rejected_count', vcd={})
 
@@ -2386,7 +2446,7 @@ class Tasks(Component):
                     self.task_abort_count.put(1)
                 return 1
 
-        def wait_for_dp(task_id, dp_committed_event):
+        def wait_for_dp(task_id, dp_committed_event,epsilon_demand, num_blocks_demand):
 
             assert not dp_committed_event.triggered
             t0 = self.env.now
@@ -2398,6 +2458,17 @@ class Tasks(Component):
 
                 self.task_ungranted_count.get(1)
                 self.task_granted_count.put(1)
+                task_class = self.resource_master._is_mice_task_dp_demand(epsilon_demand,num_blocks_demand)
+                if task_class == (True,True):
+                    self.tasks_granted_count_s_dp_s_blk.put(1)
+                elif task_class == (True,False):
+                    self.tasks_granted_count_s_dp_l_blk.put(1)
+                elif task_class == (False, True):
+                    self.tasks_granted_count_l_dp_s_blk.put(1)
+                elif task_class == (False, False):
+                    self.tasks_granted_count_l_dp_l_blk.put(1)
+                else:
+                    raise Exception('gweg')
                 return 0
 
 
@@ -2413,7 +2484,7 @@ class Tasks(Component):
 
         # listen, wait for allocation
         running_task = self.env.process(run_task(task_id, resource_allocated_event))
-        waiting_for_dp = self.env.process(wait_for_dp(task_id, dp_committed_event))
+        waiting_for_dp = self.env.process(wait_for_dp(task_id, dp_committed_event,epsilon, num_blocks_demand))
 
         # prep allocation request,
         resource_request_msg = {
@@ -2439,7 +2510,31 @@ class Tasks(Component):
         }
         # send allocation request, note, do it when child process is already listening
         self.resource_master.mail_box.put(resource_request_msg)
+
         t0 = self.env.now
+        if self.db:
+            assert isinstance(task_id, int)
+            assert isinstance(resource_request_msg["block_idx"][0], int)
+            assert isinstance(num_blocks_demand, int)
+            assert isinstance(resource_request_msg["epsilon"], float)
+            assert isinstance(resource_request_msg["cpu"], int)
+            assert isinstance(resource_request_msg["gpu"], (int, NoneType))
+            assert isinstance(resource_request_msg["memory"], (int, NoneType))
+            assert isinstance(t0, (float, int))
+
+            def db_init_task():
+                self.db.execute(
+                    'INSERT INTO tasks '
+                    '(task_id, start_block_id, num_blocks, epsilon, cpu, gpu, memory, '
+                    'start_timestamp) '
+                    'VALUES (?,?,?,?,?,?,?,?)',
+                    (task_id, resource_request_msg["block_idx"][0], num_blocks_demand, resource_request_msg["epsilon"],
+                     resource_request_msg["cpu"], resource_request_msg["gpu"], resource_request_msg["memory"], t0,
+                     ),
+                )
+
+            db_init_task()
+
         dp_grant, task_exec = yield self.env.all_of([waiting_for_dp, running_task])
 
         if dp_grant.value == 0:
@@ -2464,15 +2559,8 @@ class Tasks(Component):
             if self.resource_master.task_state[task_id]["dp_commit_timestamp"] < 0:
                 assert self.resource_master.task_state[task_id]["task_publish_timestamp"] is None
 
-            NoneType = type(None)
-            assert isinstance(task_id, int)
-            assert isinstance(resource_request_msg["block_idx"][0], int)
-            assert isinstance(num_blocks_demand, int)
-            assert isinstance(resource_request_msg["epsilon"], float)
-            assert isinstance(resource_request_msg["cpu"], int)
-            assert isinstance(resource_request_msg["gpu"], (int, NoneType))
-            assert isinstance(resource_request_msg["memory"], (int, NoneType))
-            assert isinstance(t0, (float, int))
+
+
             assert isinstance(self.resource_master.task_state[task_id]["dp_commit_timestamp"], (float, int))
             assert isinstance(self.resource_master.task_state[task_id]["resource_allocate_timestamp"],
                               (float, NoneType, int))
@@ -2480,25 +2568,23 @@ class Tasks(Component):
             assert isinstance(self.resource_master.task_state[task_id]["task_publish_timestamp"],
                               (float, NoneType, int))
 
-            def insert_db():
+            def db_update_task():
                 self.db.execute(
-                    'INSERT INTO tasks '
-                    '(task_id, start_block_id, num_blocks, epsilon, cpu, gpu, memory, '
-                    'start_timestamp, dp_commit_timestamp, resource_allocation_timestamp, completion_timestamp, publish_timestamp ) '
-                    'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-                    (task_id, resource_request_msg["block_idx"][0], num_blocks_demand, resource_request_msg["epsilon"],
-                     resource_request_msg["cpu"], resource_request_msg["gpu"], resource_request_msg["memory"], t0,
+                    'UPDATE tasks '
+                    'set dp_commit_timestamp = ?, resource_allocation_timestamp = ?, completion_timestamp = ?, publish_timestamp = ?'
+                    'where task_id= ?',
+                    (
                      self.resource_master.task_state[task_id]["dp_commit_timestamp"],
                      self.resource_master.task_state[task_id]["resource_allocate_timestamp"],
                      self.resource_master.task_state[task_id]["task_completion_timestamp"],
-                     self.resource_master.task_state[task_id]["task_publish_timestamp"]),
+                     self.resource_master.task_state[task_id]["task_publish_timestamp"],task_id),
                 )
 
             try:
-                insert_db()
+                db_update_task()
             except Exception as e:
                 time.sleep(0.3)
-                insert_db()
+                db_update_task()
         return
 
     def get_result_hook(self, result):
@@ -2508,6 +2594,26 @@ class Tasks(Component):
         result['succeed_tasks_total'] = self.db.execute(
             'SELECT COUNT() FROM tasks  WHERE  dp_commit_timestamp >=0'
         ).fetchone()[0]
+        # avg_num_blocks = (self.env.config['task.demand.num_blocks.mice'] + self.env.config['task.demand.num_blocks.elephant'])/2
+        # avg_epsilon = (self.env.config['task.demand.epsilon.mice'] + self.env.config['task.demand.epsilon.elephant']) / 2
+        result['succeed_tasks_s_dp_s_blk'] = self.db.execute(
+            'SELECT COUNT() FROM tasks  WHERE  dp_commit_timestamp >=0 and epsilon < ? and num_blocks < ?',(self.resource_master._avg_epsilon,self.resource_master._avg_num_blocks)
+        ).fetchone()[0]
+
+        result['succeed_tasks_s_dp_l_blk'] = self.db.execute(
+            'SELECT COUNT() FROM tasks  WHERE  dp_commit_timestamp >=0 and epsilon < ? and num_blocks > ?',(self.resource_master._avg_epsilon,self.resource_master._avg_num_blocks)
+        ).fetchone()[0]
+
+        result['succeed_tasks_l_dp_s_blk'] = self.db.execute(
+            'SELECT COUNT() FROM tasks  WHERE  dp_commit_timestamp >=0 and epsilon > ? and num_blocks < ?',(self.resource_master._avg_epsilon,self.resource_master._avg_num_blocks)
+        ).fetchone()[0]
+
+        result['succeed_tasks_l_dp_l_blk'] = self.db.execute(
+            'SELECT COUNT() FROM tasks  WHERE  dp_commit_timestamp >=0 and epsilon > ? and num_blocks > ?',(self.resource_master._avg_epsilon,self.resource_master._avg_num_blocks)
+        ).fetchone()[0]
+
+
+
         result['succeed_tasks_per_hour'] = result['succeed_tasks_total'] / (
                 self.env.time() / 3600
         )
@@ -2570,7 +2676,7 @@ select avg(a)from (
 
 
 if __name__ == '__main__':
-    import copy
+
     dp_arrival_itvl = 0.078125    
     rdp_arrival_itvl = 0.004264781
     N_dp = 100
@@ -2643,7 +2749,7 @@ if __name__ == '__main__':
         # policy
         
         'sim.duration': '300 s',
-        'task.timeout.interval': 25,
+        'task.timeout.interval': 51, # block arrival x2??
         'task.timeout.enabled': True,
         'task.arrival_interval': rdp_arrival_itvl,
         'resource_master.dp_policy.is_admission_control_enabled': False,
@@ -2663,7 +2769,7 @@ if __name__ == '__main__':
         'resource_master.cpu_capacity': sys.maxsize,  # number of cores
         'resource_master.memory_capacity': 624,  # in GB, assume granularity is 1GB
         'resource_master.gpu_capacity': 8,  # in cards
-        'resource_master.clock.tick_seconds': 25,
+        # 'resource_master.clock.tick_seconds': 25,
         'resource_master.clock.dpf_adaptive_tick': True,
 
         'sim.db.enable': True,
@@ -2839,7 +2945,7 @@ if __name__ == '__main__':
                 (['task.timeout.interval'],[[task_timeout_global]]),  # fixme use filter is more concise
                ]
 
-    test_factors = [(['sim.duration'], [['%d s' % 300 ]]), # 250000
+    test_factors = [(['sim.duration','task.timeout.interval','task.timeout.enabled','resource_master.dp_policy.is_admission_control_enabled'], [['%d s' % 100,21,False,False]]), # 250000
                     (['resource_master.block.is_static', 'resource_master.block.init_amount', 'task.demand.num_blocks.mice_percentage'],
                      [[True, 1,100], # single block
                       [False, 11, 75]],  # dynamic block
