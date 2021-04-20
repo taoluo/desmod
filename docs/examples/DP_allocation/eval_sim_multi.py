@@ -145,7 +145,8 @@ if __name__ == '__main__':
     dp_subconfig.dp_policy = [DP_POLICY_FCFS, DP_POLICY_DPF_T, DP_POLICY_DPF_N, DP_POLICY_RR_T,DP_POLICY_RR_NN]
     DP_N = dp_subconfig.denominator = [dp_max_amount*i for i in N_scale_factor]
     DP_T = dp_subconfig.block_lifetime = [N * dp_subconfig.dp_arrival_itvl  for N in DP_N]
-    dp_subconfig.sim_duration = '%d s' % (dp_subconfig.dp_arrival_itvl * dp_max_amount * num_arrivals_multiplier)
+    dp_subconfig.sim_duration = config['resource_master.block.arrival_interval'] * 50
+    # dp_subconfig.sim_duration = '%d s' % (dp_subconfig.dp_arrival_itvl * dp_max_amount * num_arrivals_multiplier)
     # dp_subconfig.sim_duration = '11 s'
     # dp_timeout = 50 * dp_max_amount * config['task.arrival_interval'] * config[
     #     'task.demand.epsilon.mice']  # at max, 100 tasks waiting in the queue
@@ -181,7 +182,8 @@ if __name__ == '__main__':
     rdp_subconfig.dp_policy = [DP_POLICY_FCFS, DP_POLICY_DPF_T, DP_POLICY_DPF_N]
     RDP_N = rdp_subconfig.denominator = [int(rdp_max_amount * n) for n in N_scale_factor]
     RDP_T = rdp_subconfig.block_lifetime = [N * rdp_subconfig.rdp_arrival_itvl for N in RDP_N]
-    rdp_subconfig.sim_duration = '%d s' % (rdp_subconfig.rdp_arrival_itvl* rdp_max_amount * num_arrivals_multiplier)
+    rdp_subconfig.sim_duration = config['resource_master.block.arrival_interval'] * 50
+    # rdp_subconfig.sim_duration = '%d s' % (rdp_subconfig.rdp_arrival_itvl* rdp_max_amount * num_arrivals_multiplier)
     # rdp_subconfig.sim_duration = '11 s'
 
     # 100 is the multiplier of dp between elephant and mice
