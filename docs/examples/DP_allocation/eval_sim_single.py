@@ -139,7 +139,7 @@ if __name__ == '__main__':
     dp_subconfig = Config( )
     dp_subconfig.is_rdp = False
     N_scale_factor = [.10, .50, .75, 1.00 ,1.25, 1.75, 2.00, 2.25]
-    num_arrivals_multiplier = 2.0 # for sim_duration actual arrived tasks / max allocable tasks
+    num_arrivals_multiplier = 2.25 # for sim_duration actual arrived tasks / max allocable tasks
     assert num_arrivals_multiplier in N_scale_factor
     dp_subconfig.dp_policy = [DP_POLICY_FCFS, DP_POLICY_DPF_T, DP_POLICY_DPF_N, DP_POLICY_RR_T,DP_POLICY_RR_NN]
     DP_N = dp_subconfig.denominator = [dp_max_amount*i for i in N_scale_factor]
@@ -148,7 +148,7 @@ if __name__ == '__main__':
     # dp_timeout = 50 * dp_max_amount * config['task.arrival_interval'] * config[
     #     'task.demand.epsilon.mice']  # at max, 100 tasks waiting in the queue
     # 10 is the multiplier of dp between elephant and mice
-    dp_timeout = 3 * 10  * config['task.arrival_interval']   # at max, 100 tasks waiting in the queue
+    dp_timeout = 3 * 100  * config['task.arrival_interval']   # at max, 100 tasks waiting in the queue
 
     for p in dp_subconfig.dp_policy:
         if p == DP_POLICY_FCFS:
