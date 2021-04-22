@@ -151,7 +151,7 @@ if __name__ == '__main__':
     # dp_timeout = 50 * dp_max_amount * config['task.arrival_interval'] * config[
     #     'task.demand.epsilon.mice']  # at max, 100 tasks waiting in the queue
     # 10 is the multiplier of dp between elephant and mice
-    dp_timeout = 3 * (4+1) * 10  * dp_subconfig.dp_arrival_itvl  # at max, 100 tasks waiting in the queue
+    dp_timeout = 3 * (4+1) * 100  * dp_subconfig.dp_arrival_itvl  # at max, 1500 tasks waiting in the queue
 
     for p in dp_subconfig.dp_policy:
         if p == DP_POLICY_FCFS:
@@ -187,7 +187,7 @@ if __name__ == '__main__':
     # rdp_subconfig.sim_duration = '11 s'
 
     # 100 is the multiplier of dp between elephant and mice
-    rdp_timeout = 3 * (4+1) * 100 * rdp_subconfig.rdp_arrival_itvl  # at max, 100 tasks waiting in the queue
+    rdp_timeout = 3 * (4+1) * 100 * rdp_subconfig.rdp_arrival_itvl  # at max, 1500 tasks waiting in the queue
     for p in rdp_subconfig.dp_policy:
         if p == DP_POLICY_FCFS:
             config_list.extend(list(product([rdp_subconfig.rdp_arrival_itvl],[rdp_timeout],[rdp_subconfig.is_rdp],[rdp_subconfig.sim_duration],[p],[None],[None])))
