@@ -178,7 +178,7 @@ if __name__ == '__main__':
     #
     rdp_subconfig = Config()
     rdp_subconfig.is_rdp = True
-    rdp_subconfig.rdp_arrival_itvl = 0.078125  # contention point
+    rdp_subconfig.rdp_arrival_itvl = 0.004264781  # contention point
     rdp_subconfig.dp_policy = [DP_POLICY_FCFS, DP_POLICY_DPF_T, DP_POLICY_DPF_N]
     RDP_N = rdp_subconfig.denominator = [int(rdp_max_amount * n) for n in N_scale_factor]
     RDP_T = rdp_subconfig.block_lifetime = [N * rdp_subconfig.rdp_arrival_itvl for N in RDP_N]
