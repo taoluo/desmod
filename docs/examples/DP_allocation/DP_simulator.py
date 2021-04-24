@@ -195,7 +195,7 @@ class Top(Component):
         self.resource_master = ResourceMaster(self)
         # tick_seconds = self.env.config['resource_master.clock.tick_seconds']
         if self.env.config['resource_master.clock.dpf_adaptive_tick']:
-            tick_seconds = self.env.config['task.arrival_interval'] * 5 # median arrival time x0.68
+            tick_seconds = self.env.config['task.arrival_interval'] * 0.6 # median arrival time x0.68
             self.env.config['resource_master.clock.tick_seconds'] = tick_seconds
         # tick_seconds = 0.5
         self.global_clock = Clock(tick_seconds, self)
