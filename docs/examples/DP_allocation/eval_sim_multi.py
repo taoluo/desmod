@@ -15,7 +15,7 @@ if __name__ == '__main__':
     # N_rdp = 15000 # 14514
     # T_rdp = rdp_arrival_itvl * N_rdp
     eval_dp = True
-    eval_rdp = False
+    eval_rdp = True
     config = {
         'workload_test.enabled': False,
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
@@ -68,7 +68,7 @@ if __name__ == '__main__':
 
         'sim.duration': '300 s',
         'task.timeout.interval': 21,
-        'task.timeout.enabled': True,
+        'task.timeout.enabled': False,
         'task.arrival_interval': 1,
         'resource_master.dp_policy.is_admission_control_enabled': False,
         'resource_master.dp_policy.is_rdp': True,
@@ -140,7 +140,7 @@ if __name__ == '__main__':
     dp_subconfig = Config( )
     dp_subconfig.is_rdp = False
     dp_subconfig.dp_arrival_itvl = 0.078125  # rdp contention point
-    N_scale_factor = [.10, .50, .75, 1.00 ,1.25, 1.75, 2.00, 2.25]
+    N_scale_factor = [.10, .50, .75, 1.00 ,1.25, 1.75 ] # for rdp only , 2.00, 2.25]
     N_scale_factor_ext = [2.75, 3.25, 3.75, 7.5, 11.25, 15.0]
     # num_arrivals_multiplier = 2.0 # for sim_duration actual arrived tasks / max allocable tasks
     # assert num_arrivals_multiplier in N_scale_factor
@@ -184,7 +184,7 @@ if __name__ == '__main__':
     rdp_subconfig.dp_policy = [DP_POLICY_FCFS, DP_POLICY_DPF_T, DP_POLICY_DPF_N]
     RDP_N = rdp_subconfig.denominator = [int(rdp_max_amount * n) for n in N_scale_factor]
     RDP_T = rdp_subconfig.block_lifetime = [N * rdp_subconfig.rdp_arrival_itvl for N in RDP_N]
-    rdp_subconfig.sim_duration = '%d s' % (config['resource_master.block.arrival_interval'] * 50 * 2)
+    rdp_subconfig.sim_duration = '%d s' % (config['resource_master.block.arrival_interval'] * 50)
     # rdp_subconfig.sim_duration = '%d s' % (rdp_subconfig.rdp_arrival_itvl* rdp_max_amount * num_arrivals_multiplier)
     # rdp_subconfig.sim_duration = '11 s'
 
