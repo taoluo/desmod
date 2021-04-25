@@ -619,6 +619,7 @@ class ResourceMaster(Component):
             quota_incre_upper_bound = max(incremented_quota_idx) if has_quota_increment else -1
             quota_incre_lower_bound = min(incremented_quota_idx) if has_quota_increment else -1
             # cal DRS
+            permit_dp_task_order = None
             if not self.is_rdp:
                 if dp_drs_type == DRS_DP_DEFAULT:
                     if has_quota_increment:
@@ -646,21 +647,23 @@ class ResourceMaster(Component):
 
                 # todo fixme soooo slow
                 if rdp_drs_type == DRS_RDP_alpha_all:
-                    self._cal_drs_rdp_a_all()
-
+                    if has_quota_increment or self.is_rdp:
+                        permit_dp_task_order = self._cal_drs_rdp_a_all(permit_new_arrival_tid_only=False,new_arrival_tid=new_arrival_tid)
+                    elif len(new_arrival_tid) != 0:
+                        permit_dp_task_order = self._cal_drs_rdp_a_all(permit_new_arrival_tid_only=True, new_arrival_tid= new_arrival_tid)
                 if rdp_drs_type == DRS_RDP_dom_deduct:
                     self._cal_drs_rdp_dom_deduct()
 
             else:
                 raise Exception("undefined dominant share type")
-
-            if has_quota_increment or self.is_rdp:
-                permit_dp_task_order = sorted(enumerate(self.dp_waiting_tasks.items), reverse=False,
-                                              key=lambda x: self.task_state[x[1]]['dominant_resource_share'])
-            # optimization for no new quota case
-            elif len(new_arrival_tid) != 0:
-                permit_dp_task_order = sorted(new_arrival_tid, reverse=False,
-                                              key=lambda x: self.task_state[x[1]]['dominant_resource_share'])
+            if permit_dp_task_order is None:
+                if has_quota_increment or self.is_rdp:
+                    permit_dp_task_order = sorted(enumerate(self.dp_waiting_tasks.items), reverse=False,
+                                                  key=lambda x: self.task_state[x[1]]['dominant_resource_share'])
+                # optimization for no new quota case
+                elif len(new_arrival_tid) != 0:
+                    permit_dp_task_order = sorted(new_arrival_tid, reverse=False,
+                                                  key=lambda x: self.task_state[x[1]]['dominant_resource_share'])
 
             # iterate over tasks ordered by DRS, match quota, allocate.
             permitted_task_ids = set()
@@ -749,7 +752,7 @@ class ResourceMaster(Component):
     # @profile
     def best_effort_rdp_sched_n_commit_reject(self, dp_processed_task_idx, dp_rejected_task_ids, permit_dp_task_order,
                                               permitted_blk_ids, permitted_task_ids):
-        for idx, t_id in permit_dp_task_order:
+        for drs, t_id, t_idx in permit_dp_task_order:
             # if should_grant_top_small and (not are_leading_tasks_ok):
             #     break
             this_task = self.task_state[t_id]
@@ -807,7 +810,7 @@ class ResourceMaster(Component):
                 self._commit_rdp_allocation(task_demand_block_idx, task_demand_e_rdp)
                 this_task["dp_committed_event"].succeed()
                 this_task['is_dp_granted'] = True
-                dp_processed_task_idx.append(idx)
+                dp_processed_task_idx.append(t_idx)
             else:
                 assert is_quota_insufficient_all or is_quota_insufficient_any
                 if self.block_dp_storage.items[b]["retire_event"].triggered:
@@ -817,13 +820,13 @@ class ResourceMaster(Component):
                     this_task["dp_permitted_event"].fail(DpBlockRetiredError("block %d retired, insufficient unlocked rdp left" % b))
                     # this_task["dp_committed_event"].fail(DpBlockRetiredError()) #???? delay to handling permission
                     this_task['is_dp_granted'] = False
-                    dp_processed_task_idx.append(idx)
+                    dp_processed_task_idx.append(t_idx)
 
         return
 
     def _dpf_best_effort_dp_sched(self, are_leading_tasks_ok, dp_processed_task_idx, permit_dp_task_order, permitted_blk_ids,
                                   permitted_task_ids, should_grant_top_small, this_epoch_unused_quota):
-        for idx, t_id in permit_dp_task_order:
+        for drs, t_id,t_idx in permit_dp_task_order:
             if should_grant_top_small and (not are_leading_tasks_ok):
                 break
             this_task = self.task_state[t_id]
@@ -847,7 +850,8 @@ class ResourceMaster(Component):
                 this_task["dp_permitted_event"].succeed()
                 permitted_task_ids.add(t_id)
                 permitted_blk_ids.update(task_demand_block_idx)
-                dp_processed_task_idx.append(idx)
+
+                dp_processed_task_idx.append(t_idx)
         return
 
     def _cal_drs_rdp_dom_deduct(self):
@@ -870,10 +874,27 @@ class ResourceMaster(Component):
             assert temp_max != -1
             this_task['dominant_resource_share'] = temp_max
 
-    def _cal_drs_rdp_a_all(self):
-        for t_id in reversed(self.dp_waiting_tasks.items):
+    def _cal_drs_rdp_a_all(self, permit_new_arrival_tid_only, new_arrival_tid):
+        permit_dp_task_order = []
+        hq.heapify(permit_dp_task_order)
+        # tasks_to_permit = []
+        if permit_new_arrival_tid_only:
+            tasks_to_permit = new_arrival_tid
+        else:
+            tasks_to_permit = self.dp_waiting_tasks.items
+
+        for i,task in enumerate(tasks_to_permit):
+            if permit_new_arrival_tid_only:
+                # tasks_to_permit = new_arrival_tid
+                t_idx,t_id = task
+                # t_id =
+            else:
+                # tasks_to_permit = self.dp_waiting_tasks.items
+                t_idx = i
+                t_id = task
+
             this_task = self.task_state[t_id]
-            if this_task['dominant_resource_share'] is None:
+            if permit_new_arrival_tid_only or this_task['dominant_resource_share'] is None:
                 this_request = this_task['resource_request']
                 # block wise
                 temp_max = -1
@@ -885,6 +906,14 @@ class ResourceMaster(Component):
                             temp_max = max(temp_max, normalized_e)
                 assert temp_max != -1
                 this_task['dominant_resource_share'] = temp_max
+                # assert t_id in new_arrival_tid
+            if not permit_new_arrival_tid_only:
+                hq.heappush(permit_dp_task_order,(this_task['dominant_resource_share'],t_id, t_idx) )
+            else:
+                hq.heappush(permit_dp_task_order, (this_task['dominant_resource_share'], t_id, t_idx))
+        return permit_dp_task_order
+            # else:
+            #     hq.heappush(permit_dp_task_order, (this_task['dominant_resource_share'], t_id))
 
     def _cal_drs_rdp_a_positive(self):
         for t_id in reversed(self.dp_waiting_tasks.items):
@@ -1668,6 +1697,13 @@ class ResourceMaster(Component):
         self.dp_sched_mail_box.put([block_id])
         self.debug('block_id %d retired with 0 DP left' % block_id)
 
+    def _dpfn_subloop_eol_retire(self, block_id):
+        this_block = self.block_dp_storage.items[block_id]
+        lifetime_ub = max(self.denom * self.env.config['task.arrival_interval'] * 1.1, self.env.config['resource_master.block.arrival_interval'])
+        yield self.env.timeout(lifetime_ub)
+        if not this_block['retire_event'].triggered:
+            this_block['retire_event'].succeed()
+            self.debug('block %d get retired by timeout ' % block_id)
 
     def _rr_n_subloop_eol_sched(self, block_id):
         this_block = self.block_dp_storage.items[block_id]
@@ -2085,6 +2121,8 @@ class ResourceMaster(Component):
             elif self.is_dp_policy_rr_nn:
                 block_item['block_proc'] = self.env.process(self._rr_nn_subloop_unlock_quota_n_sched(cur_block_id))
 
+            elif self.is_dp_policy_dpfn:
+                block_item['block_proc'] = self.env.process(self._dpfn_subloop_eol_retire(cur_block_id))
 
     def _commit_dp_allocation(self, block_idx: List[int], epsilon: float):
         """
