@@ -658,12 +658,18 @@ class ResourceMaster(Component):
                 raise Exception("undefined dominant share type")
             if permit_dp_task_order is None:
                 if has_quota_increment or self.is_rdp:
-                    permit_dp_task_order = sorted(enumerate(self.dp_waiting_tasks.items), reverse=False,
-                                                  key=lambda x: self.task_state[x[1]]['dominant_resource_share'])
+                    waiting_task_drs = (self.task_state[t]['dominant_resource_share'] for t in self.dp_waiting_tasks.items)
+                    permit_dp_task_order = list(zip(waiting_task_drs,enumerate(self.dp_waiting_tasks.items)))
+                    hq.heapify(permit_dp_task_order)
+                    # permit_dp_task_order = sorted(enumerate(self.dp_waiting_tasks.items), reverse=False,
+                    #                               key=lambda x: self.task_state[x[1]]['dominant_resource_share'])
                 # optimization for no new quota case
                 elif len(new_arrival_tid) != 0:
-                    permit_dp_task_order = sorted(new_arrival_tid, reverse=False,
-                                                  key=lambda x: self.task_state[x[1]]['dominant_resource_share'])
+                    new_arrival_drs = (self.task_state[t[1]]['dominant_resource_share'] for t in new_arrival_tid)
+                    permit_dp_task_order = list(zip(new_arrival_drs,new_arrival_tid))
+                    hq.heapify(permit_dp_task_order)
+                    # permit_dp_task_order = sorted(new_arrival_tid, reverse=False,
+                    #                               key=lambda x: self.task_state[x[1]]['dominant_resource_share'])
 
             # iterate over tasks ordered by DRS, match quota, allocate.
             permitted_task_ids = set()
@@ -752,9 +758,10 @@ class ResourceMaster(Component):
     # @profile
     def best_effort_rdp_sched_n_commit_reject(self, dp_processed_task_idx, dp_rejected_task_ids, permit_dp_task_order,
                                               permitted_blk_ids, permitted_task_ids):
-        for drs, t_id, t_idx in permit_dp_task_order:
+        for drs, t in permit_dp_task_order:
             # if should_grant_top_small and (not are_leading_tasks_ok):
             #     break
+            t_idx,t_id = t
             this_task = self.task_state[t_id]
             this_request = this_task["resource_request"]
 
@@ -826,7 +833,8 @@ class ResourceMaster(Component):
 
     def _dpf_best_effort_dp_sched(self, are_leading_tasks_ok, dp_processed_task_idx, permit_dp_task_order, permitted_blk_ids,
                                   permitted_task_ids, should_grant_top_small, this_epoch_unused_quota):
-        for drs, t_id,t_idx in permit_dp_task_order:
+        for drs, t in permit_dp_task_order:
+            t_idx, t_id = t
             if should_grant_top_small and (not are_leading_tasks_ok):
                 break
             this_task = self.task_state[t_id]
@@ -908,9 +916,9 @@ class ResourceMaster(Component):
                 this_task['dominant_resource_share'] = temp_max
                 # assert t_id in new_arrival_tid
             if not permit_new_arrival_tid_only:
-                hq.heappush(permit_dp_task_order,(this_task['dominant_resource_share'],t_id, t_idx) )
+                hq.heappush(permit_dp_task_order,(this_task['dominant_resource_share'], (t_idx,t_id) ) )
             else:
-                hq.heappush(permit_dp_task_order, (this_task['dominant_resource_share'], t_id, t_idx))
+                hq.heappush(permit_dp_task_order, (this_task['dominant_resource_share'], (t_idx,t_id)  ))
         return permit_dp_task_order
             # else:
             #     hq.heappush(permit_dp_task_order, (this_task['dominant_resource_share'], t_id))
