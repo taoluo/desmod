@@ -195,7 +195,7 @@ class Top(Component):
         self.resource_master = ResourceMaster(self)
         # tick_seconds = self.env.config['resource_master.clock.tick_seconds']
         if self.env.config['resource_master.clock.dpf_adaptive_tick']:
-            tick_seconds = self.env.config['task.arrival_interval'] * 0.6 # median arrival time x0.68
+            tick_seconds = self.env.config['task.arrival_interval'] * 0.5 # median arrival time x0.68
             self.env.config['resource_master.clock.tick_seconds'] = tick_seconds
         # tick_seconds = 0.5
         self.global_clock = Clock(tick_seconds, self)
@@ -1711,7 +1711,7 @@ class ResourceMaster(Component):
         yield self.env.timeout(lifetime_ub)
         if not this_block['retire_event'].triggered:
             this_block['retire_event'].succeed()
-            self.debug('block %d get retired by timeout ' % block_id)
+            self.debug('DPF-N,N=%d, block %d get retired by timeout with %d arrived tasks' % (self.denom, block_id,this_block['arrived_task_num']))
 
     def _rr_n_subloop_eol_sched(self, block_id):
         this_block = self.block_dp_storage.items[block_id]

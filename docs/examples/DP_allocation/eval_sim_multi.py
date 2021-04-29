@@ -96,7 +96,7 @@ if __name__ == '__main__':
         'sim.dot.enable': False,
         # 'sim.duration': '300000 s',  # for rdp
 
-        'sim.runtime.timeout': 60,  # in min
+        'sim.runtime.timeout': 60*24,  # in min
         # 'sim.duration': '10 s',
         'sim.gtkw.file': 'sim.gtkw',
         'sim.gtkw.live': False,
@@ -148,7 +148,7 @@ if __name__ == '__main__':
     dp_subconfig.dp_policy = [DP_POLICY_FCFS, DP_POLICY_DPF_T, DP_POLICY_DPF_N, DP_POLICY_RR_T,DP_POLICY_RR_NN]
     DP_N = dp_subconfig.denominator = [dp_max_amount*i for i in N_scale_factor + N_scale_factor_ext]
     DP_T = dp_subconfig.block_lifetime = [N * dp_subconfig.dp_arrival_itvl  for N in DP_N]
-    dp_subconfig.sim_duration = '%d s' % (config['resource_master.block.arrival_interval'] * 12)
+    dp_subconfig.sim_duration = '%d s' % (config['resource_master.block.arrival_interval'] * 30)
     # dp_subconfig.sim_duration = '%d s' % (dp_subconfig.dp_arrival_itvl * dp_max_amount * num_arrivals_multiplier)
     # dp_subconfig.sim_duration = '11 s'
     # dp_timeout = 50 * dp_max_amount * config['task.arrival_interval'] * config[
@@ -185,7 +185,7 @@ if __name__ == '__main__':
     rdp_subconfig.dp_policy = [DP_POLICY_FCFS, DP_POLICY_DPF_T, DP_POLICY_DPF_N]
     RDP_N = rdp_subconfig.denominator = [int(rdp_max_amount * n) for n in N_scale_factor]
     RDP_T = rdp_subconfig.block_lifetime = [N * rdp_subconfig.rdp_arrival_itvl for N in RDP_N]
-    rdp_subconfig.sim_duration = '%d s' % (config['resource_master.block.arrival_interval'] * 12)
+    rdp_subconfig.sim_duration = '%d s' % (config['resource_master.block.arrival_interval'] * 30)
     # rdp_subconfig.sim_duration = '%d s' % (rdp_subconfig.rdp_arrival_itvl* rdp_max_amount * num_arrivals_multiplier)
     # rdp_subconfig.sim_duration = '11 s'
 
