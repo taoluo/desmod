@@ -1707,7 +1707,7 @@ class ResourceMaster(Component):
 
     def _dpfn_subloop_eol_retire(self, block_id):
         this_block = self.block_dp_storage.items[block_id]
-        lifetime_ub = max(self.denom * self.env.config['task.arrival_interval'] * 1.1, self.env.config['resource_master.block.arrival_interval'])
+        lifetime_ub = self.env.config['resource_master.block.arrival_interval'] * self.env.config['task.demand.num_blocks.elephant'] * 1.01  # max(self.denom * self.env.config['task.arrival_interval'] * 1.1, self.env.config['resource_master.block.arrival_interval'])
         yield self.env.timeout(lifetime_ub)
         if not this_block['retire_event'].triggered:
             this_block['retire_event'].succeed()
