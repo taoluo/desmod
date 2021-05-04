@@ -2129,7 +2129,7 @@ class ResourceMaster(Component):
             elif self.is_dp_policy_rr_nn:
                 block_item['block_proc'] = self.env.process(self._rr_nn_subloop_unlock_quota_n_sched(cur_block_id))
 
-            elif self.is_dp_policy_dpfn and self.env.config['resource_master.block.is_static']:
+            elif self.is_dp_policy_dpfn and not self.env.config['resource_master.block.is_static']:
                 block_item['block_proc'] = self.env.process(self._dpfn_subloop_eol_retire(cur_block_id))
 
     def _commit_dp_allocation(self, block_idx: List[int], epsilon: float):
