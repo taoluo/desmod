@@ -15,6 +15,9 @@ if __name__ == '__main__':
     N_rdp = 15000 # 14514
     T_rdp = rdp_arrival_itvl * N_rdp
 
+    run_dp = False
+    run_rdp = True
+
     config = {
         'workload_test.enabled': False,
         'workload_test.workload_trace_file': '/home/tao2/desmod/docs/examples/DP_allocation/workloads.yaml',
@@ -139,8 +142,8 @@ if __name__ == '__main__':
     dp_subconfig = Config( )
     dp_subconfig.is_rdp = False
     N_scale_factor = [.10, .50, .75, 1.00 ,1.25, 1.75, 2.00, 2.25]
-    num_arrivals_multiplier = 2.25 # for sim_duration actual arrived tasks / max allocable tasks
-    assert num_arrivals_multiplier in N_scale_factor
+    num_arrivals_multiplier = 2.25 * 1.05 # for sim_duration actual arrived tasks / max allocable tasks
+    # assert num_arrivals_multiplier in N_scale_factor
     dp_subconfig.dp_policy = [DP_POLICY_FCFS, DP_POLICY_DPF_T, DP_POLICY_DPF_N, DP_POLICY_RR_T,DP_POLICY_RR_NN]
     DP_N = dp_subconfig.denominator = [dp_max_amount*i for i in N_scale_factor]
     DP_T = dp_subconfig.block_lifetime = [N * config['task.arrival_interval'] for N in DP_N]
@@ -149,20 +152,20 @@ if __name__ == '__main__':
     #     'task.demand.epsilon.mice']  # at max, 100 tasks waiting in the queue
     # 10 is the multiplier of dp between elephant and mice
     dp_timeout = 3 * 100  * config['task.arrival_interval']   # at max, 100 tasks waiting in the queue
-
-    for p in dp_subconfig.dp_policy:
-        if p == DP_POLICY_FCFS:
-            config_list.extend(list(product([dp_timeout],[dp_subconfig.is_rdp],[dp_subconfig.sim_duration],[p],[None],[None])))
-        elif p == DP_POLICY_DPF_T:
-            config_list.extend(list(product([dp_timeout],[dp_subconfig.is_rdp],[dp_subconfig.sim_duration],[p],[None],DP_T)))
-        elif p == DP_POLICY_DPF_N:
-            config_list.extend(list(product([dp_timeout],[dp_subconfig.is_rdp],[dp_subconfig.sim_duration],[p],DP_N,[None])))
-        elif p == DP_POLICY_RR_T:
-            config_list.extend(list(product([dp_timeout],[dp_subconfig.is_rdp],[dp_subconfig.sim_duration],[p],[None],DP_T)))
-        elif p == DP_POLICY_RR_NN:
-            config_list.extend(list(product([dp_timeout],[dp_subconfig.is_rdp],[dp_subconfig.sim_duration],[p],DP_N,[None])))
-        else:
-            raise Exception()
+    if run_dp:
+        for p in dp_subconfig.dp_policy:
+            if p == DP_POLICY_FCFS:
+                config_list.extend(list(product([dp_timeout],[dp_subconfig.is_rdp],[dp_subconfig.sim_duration],[p],[None],[None])))
+            elif p == DP_POLICY_DPF_T:
+                config_list.extend(list(product([dp_timeout],[dp_subconfig.is_rdp],[dp_subconfig.sim_duration],[p],[None],DP_T)))
+            elif p == DP_POLICY_DPF_N:
+                config_list.extend(list(product([dp_timeout],[dp_subconfig.is_rdp],[dp_subconfig.sim_duration],[p],DP_N,[None])))
+            elif p == DP_POLICY_RR_T:
+                config_list.extend(list(product([dp_timeout],[dp_subconfig.is_rdp],[dp_subconfig.sim_duration],[p],[None],DP_T)))
+            elif p == DP_POLICY_RR_NN:
+                config_list.extend(list(product([dp_timeout],[dp_subconfig.is_rdp],[dp_subconfig.sim_duration],[p],DP_N,[None])))
+            else:
+                raise Exception()
 
 
     # RDP
@@ -182,19 +185,20 @@ if __name__ == '__main__':
     rdp_subconfig.sim_duration = '%d s' % (config['task.arrival_interval'] * rdp_max_amount * num_arrivals_multiplier)
     # 100 is the multiplier of dp between elephant and mice
     rdp_timeout = 3 * 100 * config['task.arrival_interval']  # at max, 100 tasks waiting in the queue
-    for p in rdp_subconfig.dp_policy:
-        if p == DP_POLICY_FCFS:
-            config_list.extend(list(product([rdp_timeout],[rdp_subconfig.is_rdp],[rdp_subconfig.sim_duration],[p],[None],[None])))
-        elif p == DP_POLICY_DPF_T:
-            config_list.extend(list(product([rdp_timeout],[rdp_subconfig.is_rdp],[rdp_subconfig.sim_duration],[p],[None],RDP_T)))
-        elif p == DP_POLICY_DPF_N:
-            config_list.extend(list(product([rdp_timeout],[rdp_subconfig.is_rdp],[rdp_subconfig.sim_duration],[p],RDP_N,[None])))
-        # elif p == DP_POLICY_RR_T:
-        #     config_list.append(product([rdp_subconfig.is_rdp],[rdp_subconfig.sim_duration],[p],[None],[RDP_T]))
-        # elif p == DP_POLICY_RR_NN:
-        #     config_list.append(product([rdp_subconfig.is_rdp],[rdp_subconfig.sim_duration],[p],[RDP_N],[None]))
-        else:
-            raise Exception()
+    if run_rdp:
+        for p in rdp_subconfig.dp_policy:
+            if p == DP_POLICY_FCFS:
+                config_list.extend(list(product([rdp_timeout],[rdp_subconfig.is_rdp],[rdp_subconfig.sim_duration],[p],[None],[None])))
+            elif p == DP_POLICY_DPF_T:
+                config_list.extend(list(product([rdp_timeout],[rdp_subconfig.is_rdp],[rdp_subconfig.sim_duration],[p],[None],RDP_T)))
+            elif p == DP_POLICY_DPF_N:
+                config_list.extend(list(product([rdp_timeout],[rdp_subconfig.is_rdp],[rdp_subconfig.sim_duration],[p],RDP_N,[None])))
+            # elif p == DP_POLICY_RR_T:
+            #     config_list.append(product([rdp_subconfig.is_rdp],[rdp_subconfig.sim_duration],[p],[None],[RDP_T]))
+            # elif p == DP_POLICY_RR_NN:
+            #     config_list.append(product([rdp_subconfig.is_rdp],[rdp_subconfig.sim_duration],[p],[RDP_N],[None]))
+            else:
+                raise Exception()
 
     real_config_fields = ['task.timeout.interval','resource_master.dp_policy.is_rdp', 'sim.duration', 'resource_master.dp_policy',
                          'resource_master.dp_policy.denominator', 'resource_master.block.lifetime']
