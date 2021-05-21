@@ -141,11 +141,11 @@ if __name__ == '__main__':
     dp_max_amount = 100
     dp_subconfig = Config( )
     dp_subconfig.is_rdp = False
-    N_scale_factor = [.10, .50, .75, 1.00 ,1.25, 1.75, 2.00, 2.25]
+    N_scale_factor = [.10, .50, .75, 1.00 ,1.25, 1.75, 2.00, 2.25, 2.75, 3.25]
     num_arrivals_multiplier = 2.25 * 1.05 # for sim_duration actual arrived tasks / max allocable tasks
     # assert num_arrivals_multiplier in N_scale_factor
     dp_subconfig.dp_policy = [DP_POLICY_FCFS, DP_POLICY_DPF_T, DP_POLICY_DPF_N, DP_POLICY_RR_T,DP_POLICY_RR_NN]
-    DP_N = dp_subconfig.denominator = [dp_max_amount*i for i in N_scale_factor]
+    DP_N = dp_subconfig.denominator = [1] + [dp_max_amount*i for i in N_scale_factor]
     DP_T = dp_subconfig.block_lifetime = [N * config['task.arrival_interval'] for N in DP_N]
     dp_subconfig.sim_duration = '%d s' % (config['task.arrival_interval'] * dp_max_amount * num_arrivals_multiplier)
     # dp_timeout = 50 * dp_max_amount * config['task.arrival_interval'] * config[
@@ -180,7 +180,7 @@ if __name__ == '__main__':
     rdp_subconfig.is_rdp = True
 
     rdp_subconfig.dp_policy = [DP_POLICY_FCFS, DP_POLICY_DPF_T, DP_POLICY_DPF_N]
-    RDP_N = rdp_subconfig.denominator = [int(rdp_max_amount * n) for n in N_scale_factor]
+    RDP_N = rdp_subconfig.denominator = [1] + [int(rdp_max_amount * n) for n in N_scale_factor]
     RDP_T = rdp_subconfig.block_lifetime = [N * config['task.arrival_interval'] for N in RDP_N]
     rdp_subconfig.sim_duration = '%d s' % (config['task.arrival_interval'] * rdp_max_amount * num_arrivals_multiplier)
     # 100 is the multiplier of dp between elephant and mice
