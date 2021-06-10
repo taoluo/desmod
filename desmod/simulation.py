@@ -233,10 +233,7 @@ def simulate(
             result['sim.exception'] = repr(e)
     if result.get('sim.exception') is not None:
         err_file = os.path.join(config['meta.sim.workspace'] ,'err.yaml')
-        if result['config'].get('meta.sim.special') is None:
-            result['config']['meta.sim.special'] = []
-        result['config']['meta.sim.special'].append(result.get('sim.exception'))
-        _dump_dict(err_file,result['config']['meta.sim.special'])
+        _dump_dict(err_file,result['sim.exception'] )
 
     return result
 
