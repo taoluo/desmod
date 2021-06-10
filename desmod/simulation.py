@@ -233,6 +233,8 @@ def simulate(
             result['sim.exception'] = repr(e)
     if result.get('sim.exception') is not None:
         err_file = os.path.join(config['meta.sim.workspace'] ,'err.yaml')
+        if result['config'].get('meta.sim.special') is None:
+            result['config']['meta.sim.special'] = []
         result['config']['meta.sim.special'].append(result.get('sim.exception'))
         _dump_dict(err_file,result['config']['meta.sim.special'])
 
@@ -405,7 +407,7 @@ def _dump_dict(filename: str, dump_dict: Dict[str, Any]):
             raise ValueError(f'Invalid extension: {ext}')
         with open(filename, 'w') as dump_file:
             if ext in ['.yaml', '.yml']:
-                yaml.safe_dump(dump_dict, stream=dump_file)
+                yaml.dump(dump_dict, stream=dump_file)
             elif ext == '.json':
                 json.dump(dump_dict, dump_file, sort_keys=True, indent=2)
             else:
