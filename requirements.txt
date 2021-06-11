@@ -11,16 +11,5 @@ Sphinx
 sphinx-rtd-theme
 tox
 pyvcd
-path
-EasyProcess
-pyvirtualdisplay
-pyscreenshot
-pillow
-docutils
-Sphinx
-pyDigitalWaveTools
-
 PyYAML
-progressbar2
--e git+https://github.com/ttaoluo/simpy.git@3e78154#egg=simpy
 

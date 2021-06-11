@@ -1,6 +1,10 @@
-pyvcd
-PyYAML
-progressbar2
-colorama
--e git+https://github.com/ttaoluo/simpy.git@3e78154#egg=simpy
+# for gtkwave save image.
+path
+EasyProcess
+pyvirtualdisplay
+pyscreenshot
+pillow
+docutils
+Sphinx
+pyDigitalWaveTools
 
