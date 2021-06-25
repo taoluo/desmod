@@ -22,8 +22,8 @@ conda init
 conda create -n pypy -c conda-forge pypy=7.3.3 -y
 conda activate pypy
 cd /mnt/data
-git clone https://github.com/ttaoluo/desmod.git
-cd desmod
+git clone git://github.com/taoluo/PrivacySchedSim.git
+cd PrivacySchedSim
 pip install -r requirements.txt
 pip install -e .
 

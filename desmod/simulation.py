@@ -213,7 +213,7 @@ def simulate(
                 except BaseException as e:
                     env.tracemgr.trace_exception()
                     result['sim.exception'] = repr(e)
-                    _dump_dict('err.yaml',result['sim.exception'] 
+                    _dump_dict('err.yaml',result['sim.exception'])
                     raise
                 else:
                     result['sim.exception'] = None

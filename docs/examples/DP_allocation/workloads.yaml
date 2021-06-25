@@ -48,7 +48,7 @@
   start_block_index: 0
   end_block_index: 2
   epsilon: 1.1
-  completion_time: 1.0
+  completion_time:fixme 1.0
   cpu_demand: 1
   gpu_demand: 1
   memory_demand: 1

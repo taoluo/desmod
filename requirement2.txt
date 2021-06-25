@@ -1,10 +1,2 @@
-# for gtkwave save image.
-path
-EasyProcess
-pyvirtualdisplay
-pyscreenshot
-pillow
-docutils
-Sphinx
-pyDigitalWaveTools
+
 
