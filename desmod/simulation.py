@@ -213,6 +213,7 @@ def simulate(
                 except BaseException as e:
                     env.tracemgr.trace_exception()
                     result['sim.exception'] = repr(e)
+                    _dump_dict('err.yaml',result['sim.exception'] 
                     raise
                 else:
                     result['sim.exception'] = None
@@ -231,9 +232,6 @@ def simulate(
         result.setdefault('sim.runtime', timeit.default_timer() - t0)
         if result.get('sim.exception') is None:
             result['sim.exception'] = repr(e)
-    if result.get('sim.exception') is not None:
-        err_file = os.path.join(config['meta.sim.workspace'] ,'err.yaml')
-        _dump_dict(err_file,result['sim.exception'] )
 
     return result
 
