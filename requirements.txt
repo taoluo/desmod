@@ -1,4 +1,4 @@
-black >= 19.10b0; implementation_name == "cpython"
+black >= 20.8b1; implementation_name == "cpython"
 colorama
 flake8
 isort
@@ -13,3 +13,5 @@ tox
 pyvcd
 PyYAML
 
+
+types-PyYAML
