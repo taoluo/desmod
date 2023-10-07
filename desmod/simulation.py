@@ -404,8 +404,19 @@ def _dump_dict(filename: str, dump_dict: Dict[str, Any]):
             raise ValueError(f'Invalid extension: {ext}')
         with open(filename, 'w') as dump_file:
             if ext in ['.yaml', '.yml']:
+                for k in dump_dict:
+                    try:
+                        yaml.dump(dump_dict[k])
+                    except:
+                        dump_dict[k] = None
                 yaml.dump(dump_dict, stream=dump_file)
+
             elif ext == '.json':
+                for k in dump_dict:
+                    try:
+                        json.dump(dump_dict[k])
+                    except:
+                        dump_dict[k] =  None
                 json.dump(dump_dict, dump_file, sort_keys=True, indent=2)
             else:
                 assert ext == '.py'
